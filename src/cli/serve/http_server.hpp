@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/cli/serve/generation_metrics.hpp"
+#include "src/cli/serve/request_progress.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 
 namespace gufo::server {
@@ -163,6 +164,14 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
                                         std::memory_order_relaxed);
   detail::TotalGenTokens().fetch_add(result.completion_tokens,
                                      std::memory_order_relaxed);
+  detail::LastTtftMs().store(static_cast<std::uint64_t>(result.ttft_ms + 0.5),
+                             std::memory_order_relaxed);
+  detail::LastQueueMs().store(static_cast<std::uint64_t>(result.queue_ms + 0.5),
+                              std::memory_order_relaxed);
+  detail::LastPromptTokens().store(result.prompt_tokens,
+                                   std::memory_order_relaxed);
+  detail::LastCompletionTokens().store(result.completion_tokens,
+                                       std::memory_order_relaxed);
 
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =

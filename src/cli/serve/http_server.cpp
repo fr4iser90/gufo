@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -592,8 +593,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.complete(
+      prompt, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); },
+      req.client_id);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -658,7 +662,10 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.chat(
+      chat, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -736,7 +743,10 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.chat(
+      chat, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -793,8 +803,11 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
   const std::string prompt = input->str();
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.complete(
+      prompt, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); },
+      req.client_id);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -820,11 +833,10 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
-  const std::string model = req.query_param("model");
+HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
+  std::string model = req.query_param("model");
   if (model.empty()) {
-    return Err(400, "Bad Request", "'model' query parameter is required",
-               "invalid_request_error", "missing_model");
+    model = b.model_id();
   }
   json::Value resp = json::Value::object();
   resp["model"] = model;
@@ -847,29 +859,99 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   return Ok(resp);
 }
 
-HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend&) {
+std::size_t ProcessRssMiB() {
+  std::ifstream input("/proc/self/status");
+  for (std::string line; std::getline(input, line);) {
+    if (line.starts_with("VmRSS:")) {
+      std::istringstream value(line.substr(6));
+      std::size_t kib = 0;
+      if (value >> kib) {
+        return kib / 1024;
+      }
+    }
+  }
+  return 0;
+}
+
+HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
+  const auto prompt_total =
+      detail::TotalPromptTokens().load(std::memory_order_relaxed);
+  const auto gen_total =
+      detail::TotalGenTokens().load(std::memory_order_relaxed);
+  const auto prompt_speed =
+      detail::LastPromptSpeed().load(std::memory_order_relaxed);
+  const auto gen_speed =
+      detail::LastGenSpeed().load(std::memory_order_relaxed);
+  const auto active =
+      detail::ActiveGenerations().load(std::memory_order_relaxed);
+  const auto ttft_ms = detail::LastTtftMs().load(std::memory_order_relaxed);
+  const auto queue_ms = detail::LastQueueMs().load(std::memory_order_relaxed);
+  const auto last_prompt =
+      detail::LastPromptTokens().load(std::memory_order_relaxed);
+  const auto last_completion =
+      detail::LastCompletionTokens().load(std::memory_order_relaxed);
+  const auto rss_mib = ProcessRssMiB();
+
+  // Escape model id for Prometheus label values.
+  std::string model_label;
+  for (const unsigned char c : b.model_id()) {
+    if (c == '\\' || c == '"') {
+      model_label += '\\';
+    }
+    model_label += static_cast<char>(c);
+  }
+
   std::ostringstream out;
+  out << std::fixed;
+  // llama.cpp-compatible names kept for existing scrapers / Open WebUI.
   out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed\n"
       << "# TYPE llamacpp:prompt_tokens_total counter\n"
-      << "llamacpp:prompt_tokens_total "
-      << detail::TotalPromptTokens().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_tokens_total " << prompt_total << "\n"
       << "# HELP llamacpp:tokens_predicted_total Total tokens generated\n"
       << "# TYPE llamacpp:tokens_predicted_total counter\n"
-      << "llamacpp:tokens_predicted_total "
-      << detail::TotalGenTokens().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:tokens_predicted_total " << gen_total << "\n"
       << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
-      << "llamacpp:prompt_tokens_seconds "
-      << detail::LastPromptSpeed().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_tokens_seconds " << prompt_speed << "\n"
       << "# HELP llamacpp:predicted_tokens_seconds Generation speed in tokens "
          "per second\n"
       << "# TYPE llamacpp:predicted_tokens_seconds gauge\n"
-      << "llamacpp:predicted_tokens_seconds "
-      << detail::LastGenSpeed().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:predicted_tokens_seconds " << gen_speed << "\n"
       << "# HELP llamacpp:kv_cache_usage_ratio KV cache usage ratio\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
-      << "llamacpp:kv_cache_usage_ratio 0.0\n";
+      << "llamacpp:kv_cache_usage_ratio 0.0\n"
+      // Gufo-native gauges for operators (active work + last request snapshot).
+      << "# HELP gufo_generations_active In-flight text generations\n"
+      << "# TYPE gufo_generations_active gauge\n"
+      << "gufo_generations_active " << active << "\n"
+      << "# HELP gufo_ttft_ms_last Time to first token of the last completed "
+         "request\n"
+      << "# TYPE gufo_ttft_ms_last gauge\n"
+      << "gufo_ttft_ms_last " << ttft_ms << "\n"
+      << "# HELP gufo_queue_ms_last Queue wait of the last completed request\n"
+      << "# TYPE gufo_queue_ms_last gauge\n"
+      << "gufo_queue_ms_last " << queue_ms << "\n"
+      << "# HELP gufo_prompt_tokens_last Prompt tokens of the last completed "
+         "request\n"
+      << "# TYPE gufo_prompt_tokens_last gauge\n"
+      << "gufo_prompt_tokens_last " << last_prompt << "\n"
+      << "# HELP gufo_completion_tokens_last Completion tokens of the last "
+         "completed request\n"
+      << "# TYPE gufo_completion_tokens_last gauge\n"
+      << "gufo_completion_tokens_last " << last_completion << "\n"
+      << "# HELP gufo_prompt_tokens_seconds Last observed prefill tokens/s\n"
+      << "# TYPE gufo_prompt_tokens_seconds gauge\n"
+      << "gufo_prompt_tokens_seconds " << prompt_speed << "\n"
+      << "# HELP gufo_predicted_tokens_seconds Last observed decode tokens/s\n"
+      << "# TYPE gufo_predicted_tokens_seconds gauge\n"
+      << "gufo_predicted_tokens_seconds " << gen_speed << "\n"
+      << "# HELP gufo_process_resident_memory_mib Process RSS in MiB\n"
+      << "# TYPE gufo_process_resident_memory_mib gauge\n"
+      << "gufo_process_resident_memory_mib " << rss_mib << "\n"
+      << "# HELP gufo_model_info Served model id\n"
+      << "# TYPE gufo_model_info gauge\n"
+      << "gufo_model_info{model=\"" << model_label << "\"} 1\n";
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),

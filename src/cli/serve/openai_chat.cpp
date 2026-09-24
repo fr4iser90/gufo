@@ -1334,8 +1334,11 @@ private:
 HttpResponse NonStreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
-    TextGenerationBackend::InitialOutputState initial_output_state) {
-  const auto result = generation->Wait();
+    TextGenerationBackend::InitialOutputState initial_output_state,
+    const std::string& request_id) {
+  RequestProgressLogger progress(request_id);
+  const auto result = generation->Wait(
+      [&](std::string_view piece) { return progress.OnPiece(piece); });
   core::Utf8Decoder decoder;
   const ParsedGeneration generated =
       ParseGeneration(decoder.Push(result.text, true), initial_output_state,
@@ -1388,7 +1391,8 @@ HttpResponse NonStreamingResponse(
 HttpResponse StreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
     std::shared_ptr<TextGenerationBackend::GenerationRequest> generation,
-    TextGenerationBackend::InitialOutputState initial_output_state) {
+    TextGenerationBackend::InitialOutputState initial_output_state,
+    std::string request_id) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
   const std::string model = backend.model_id();
@@ -1405,8 +1409,9 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state,
+           initial_output_state, request_id = std::move(request_id),
            stream_log](const HttpResponse::BodyWriter& writer) {
+            RequestProgressLogger progress(request_id);
             json::Value role_delta = json::Value::object();
             role_delta["role"] = "assistant";
             if (!writer(Sse(
@@ -1435,6 +1440,7 @@ HttpResponse StreamingResponse(
 
             try {
               const auto result = generation->Wait([&](std::string_view piece) {
+                progress.OnPiece(piece);
                 return connected && filter.Push(piece);
               });
               stream_log->details = GenerationLogDetails(result);
@@ -1534,13 +1540,13 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
-                           request.is_cancelled, parsed.stream);
+                           request.is_cancelled, /*stream_output=*/true);
     if (parsed.stream) {
       return StreamingResponse(parsed, backend, std::move(generation),
-                               initial_output_state);
+                               initial_output_state, request.request_id);
     }
     return NonStreamingResponse(parsed, backend, generation,
-                                initial_output_state);
+                                initial_output_state, request.request_id);
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
   } catch (const std::invalid_argument& exception) {
