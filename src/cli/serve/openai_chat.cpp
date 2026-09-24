@@ -320,28 +320,16 @@ bool ParseTools(const json::Value* tools,
     }
 
     const json::Value* function = item.find("function");
-    const json::Value* name_src = nullptr;
-    const json::Value* desc_src = nullptr;
-    const json::Value* params_src = nullptr;
-    if (function != nullptr && function->is_object()) {
-      name_src = function;
-      desc_src = function;
-      params_src = function->find("parameters");
-      if (params_src == nullptr || params_src->is_null()) {
-        params_src = function->find("parametersJsonSchema");
-      }
-    } else {
-      name_src = &item;
-      desc_src = &item;
-      params_src = item.find("parameters");
-      if (params_src == nullptr || params_src->is_null()) {
-        params_src = item.find("parametersJsonSchema");
-      }
+    const json::Value* src =
+        (function != nullptr && function->is_object()) ? function : &item;
+    const json::Value* params_src = src->find("parameters");
+    if (params_src == nullptr || params_src->is_null()) {
+      params_src = src->find("parametersJsonSchema");
     }
 
     tokenization::ChatTool tool;
-    tool.name = name_src->member_str("name");
-    tool.description = desc_src->member_str("description");
+    tool.name = src->member_str("name");
+    tool.description = src->member_str("description");
     if (tool.name.empty()) {
       Logger::Warn("http", "skipping function tool without name");
       continue;
@@ -355,7 +343,36 @@ bool ParseTools(const json::Value* tools,
     tool.parameters_json = (params_src != nullptr && params_src->is_object())
                                ? params_src->dump()
                                : "{}";
-    tool.definition_json = item.dump();
+
+    // Templates prefer definition_json over name/parameters_json. Always emit
+    // the nested Chat Completions shape so Qwen and DS4 see normalized fields.
+    json::Value function_obj = json::Value::object();
+    function_obj.append_member("name", tool.name);
+    if (!tool.description.empty()) {
+      function_obj.append_member("description", tool.description);
+    }
+    function_obj.append_member("parameters", json::parse(tool.parameters_json));
+    if (function != nullptr && function->is_object()) {
+      for (const auto& [key, value] : function->members()) {
+        if (key == "name" || key == "description" || key == "parameters" ||
+            key == "parametersJsonSchema") {
+          continue;
+        }
+        function_obj.append_member(key, value);
+      }
+    }
+    json::Value definition = json::Value::object();
+    definition.append_member("type", "function");
+    definition.append_member("function", std::move(function_obj));
+    for (const auto& [key, value] : item.members()) {
+      if (key == "type" || key == "function" || key == "name" ||
+          key == "description" || key == "parameters" ||
+          key == "parametersJsonSchema") {
+        continue;
+      }
+      definition.append_member(key, value);
+    }
+    tool.definition_json = definition.dump();
     output->push_back(std::move(tool));
   }
   return true;

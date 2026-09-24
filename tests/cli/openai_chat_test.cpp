@@ -491,6 +491,48 @@ void TestLenientToolsTolerateAgentClients() {
          "Responses-style flat function tools are accepted");
   Expect(backend.last_request.tools[2].name == "ok",
          "complete tools still reach the backend");
+
+  for (const auto& tool : backend.last_request.tools) {
+    const auto definition = gufo::json::parse(tool.definition_json);
+    const auto* function = definition.find("function");
+    Expect(definition.member_str("type") == "function" && function != nullptr &&
+               function->is_object() &&
+               function->member_str("name") == tool.name &&
+               function->find("parameters") != nullptr &&
+               function->find("parameters")->is_object(),
+           "definition_json is nested Chat Completions shape for templates");
+  }
+
+  gufo::tokenization::ChatTemplateOptions options;
+  options.enable_thinking = false;
+  const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+      backend.last_request.messages, backend.last_request.tools, options);
+  Expect(rendered.has_value(), "Qwen template renders lenient tools");
+  Expect(
+      rendered->find(
+          R"({"type": "function", "function": {"name": "no_params", "parameters": {}}})") !=
+          std::string::npos,
+      "Qwen prompt gets parameters={} for missing schemas");
+  Expect(
+      rendered->find(
+          R"({"type": "function", "function": {"name": "flat_tool", "parameters": {"type": "object"}}})") !=
+          std::string::npos,
+      "Qwen prompt nests flat Responses-style tools under function");
+  Expect(rendered->find(R"({"type": "function", "name": "flat_tool")") ==
+             std::string::npos,
+         "Qwen prompt must not emit flat top-level tool shapes");
+
+  // DS4 extracts definition_json["function"]; a flat dump makes operator[]
+  // insert null and poison the tool list.
+  for (const auto& tool : backend.last_request.tools) {
+    const auto root = gufo::json::parse(tool.definition_json);
+    const auto* function = root.find("function");
+    Expect(function != nullptr && function->is_object() &&
+               !function->member_str("name").empty() &&
+               function->find("parameters") != nullptr &&
+               function->find("parameters")->is_object(),
+           "DS4 function extraction stays an object, never null");
+  }
 }
 
 void TestQwenToolBoundariesAndSchema() {
@@ -734,21 +776,32 @@ void TestCompleteToolDefinitionsReachTemplate() {
   Expect(response.status == 200 && backend.last_request.tools.size() == 1,
          "complete function definition reaches the backend");
   const auto& tool = backend.last_request.tools.front();
-  Expect(
-      tool.definition_json ==
-          R"({"type":"function","function":{"name":"emit","strict":true,"parameters":{"type":"object","additionalProperties":false}},"vendor":{"version":2}})",
-      "tool fields, omitted description and original field order survive");
+  const auto definition = gufo::json::parse(tool.definition_json);
+  const auto* function = definition.find("function");
+  const auto* strict = function != nullptr ? function->find("strict") : nullptr;
+  const auto* parameters =
+      function != nullptr ? function->find("parameters") : nullptr;
+  const auto* vendor = definition.find("vendor");
+  Expect(definition.member_str("type") == "function" && function != nullptr &&
+             function->is_object() && function->member_str("name") == "emit" &&
+             strict != nullptr && strict->is_bool() && strict->as_bool() &&
+             parameters != nullptr && parameters->is_object() &&
+             parameters->find("additionalProperties") != nullptr &&
+             vendor != nullptr && vendor->is_object() &&
+             vendor->member_size("version") == 2,
+         "canonical definition keeps name, parameters, strict and vendor");
   gufo::tokenization::ChatTemplateOptions options;
   options.enable_thinking = false;
   const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
       backend.last_request.messages, backend.last_request.tools, options);
   Expect(
-      rendered &&
-          rendered->find(
-              "<tools>\n"
-              R"({"type": "function", "function": {"name": "emit", "strict": true, "parameters": {"type": "object", "additionalProperties": false}}, "vendor": {"version": 2}})"
-              "\n</tools>") != std::string::npos,
-      "template serializes the complete original tool object");
+      rendered.has_value() &&
+          rendered->find("\"name\": \"emit\"") != std::string::npos &&
+          rendered->find("\"strict\": true") != std::string::npos &&
+          rendered->find("\"additionalProperties\": false") !=
+              std::string::npos &&
+          rendered->find("\"vendor\": {\"version\": 2}") != std::string::npos,
+      "template renders nested function plus preserved extras");
 }
 
 void TestAllSamplingControlsReachBackend() {
