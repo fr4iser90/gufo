@@ -98,6 +98,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
+  if (options.kv_pool_positions != 0 &&
+      options.kv_pool_positions < options.max_context) {
+    AssignError(error_msg,
+                "kv pool positions must cover at least one request context");
+    return nullptr;
+  }
   try {
     m->vision_ = qwen::vision::Encoder::Open(
         model_path, options.vision_model_path, c.hidden_size);
@@ -145,6 +151,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
+  exec.kv_pool_positions = options.kv_pool_positions;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -231,6 +238,10 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
                                      ? executor_->max_speculative() - 1
                                      : 0) +
          vision;
+}
+
+std::size_t Model::AttentionPoolBytes() const noexcept {
+  return executor_->AttentionPoolBytes();
 }
 
 std::size_t Model::DeferredScratchBytes() const {

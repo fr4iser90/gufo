@@ -171,8 +171,12 @@ These apply to every modality, before or after the subcommand:
   port will not answer.
 - `sessions` (`-j`) — preallocated GPU request sessions. In practice: more
   sessions means more requests can compute at once, at the cost of memory
-  per session. This option applies to LLM serving; image and speech servers
-  use their own bounded queues.
+  unless Flash-Next `--kv-pool-positions` shares attention KV. This option
+  applies to LLM serving; image and speech servers use their own bounded
+  queues.
+- `kv-pool-positions` — Flash-Next shared attention KV positions (Halogen-style).
+  `0` (default) keeps private arenas. When set, must be ≥ `--context`; slots
+  reserve spans lazily so several conversations can share one pool.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
   clients beyond the limit queue or are refused instead of piling up.
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly

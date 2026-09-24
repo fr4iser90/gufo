@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/position_pool.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -106,6 +108,9 @@ private:
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   bool mtp_enabled_{false};
+  bool kv_pooled_{false};  ///< trunk KV/block_k come from the executor pool
+  std::uint32_t kv_base_{0};
+  std::uint32_t kv_reserved_{0};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
@@ -136,12 +141,17 @@ private:
 /// sized once for `max_batch` tokens; longer prompts are fed in chunks.
 class Executor {
 public:
+  friend class Session;
   struct Options {
     std::uint32_t max_batch{1};
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Shared attention-position capacity across sessions. Zero keeps today's
+    /// private per-session KV arenas. Non-zero allocates one Halogen-style
+    /// pool; sessions reserve contiguous spans lazily as context grows.
+    std::uint32_t kv_pool_positions{0};
   };
 
   ~Executor();
@@ -161,6 +171,12 @@ public:
   [[nodiscard]] std::size_t SessionBytes(
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
+  /// Device bytes of the shared attention pool, or zero when disabled.
+  [[nodiscard]] std::size_t AttentionPoolBytes() const noexcept;
+  [[nodiscard]] std::uint32_t kv_pool_positions() const noexcept {
+    return options_.kv_pool_positions;
+  }
+  [[nodiscard]] std::uint32_t kv_pool_used() const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
@@ -381,6 +397,10 @@ private:
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, std::string* error_msg) const;
+  [[nodiscard]] bool EnsureSessionKv(Session& session, std::uint32_t need,
+                                     std::string* error_msg) const;
+  void BindSessionKv(Session& session) const;
+  void ReleaseSessionKv(Session& session) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -558,6 +578,20 @@ private:
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   mutable unsigned q8_slot_{0};
+
+  struct SharedAttentionPool {
+    PositionPool positions;
+    std::mutex mutex;
+    /// One entry per full-attention layer (not indexed by layer id).
+    std::vector<__half*> k;
+    std::vector<__half*> v;
+    std::vector<__half*> block_k;
+    std::vector<std::uint32_t> layer_index;  ///< layer id -> pool slot
+    std::size_t bytes{0};
+    explicit SharedAttentionPool(std::uint32_t capacity)
+        : positions(capacity) {}
+  };
+  mutable std::unique_ptr<SharedAttentionPool> attention_pool_;
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -31,9 +31,22 @@ rollback and RNG. See [MTP qualification](QUALITY.md).
 
 The official template defaults to thinking on, `xhigh` effort and preserving
 prior reasoning. Use the [reasoning controls](../../SERVER.md#reasoning-controls)
-for explicit effort/thinking overrides. Native context is 262144; YaRN extension
-is unsupported. Memory grows with used context and selected rollback depth;
+for explicit effort/thinking overrides. Memory grows with used context and selected rollback depth;
 admission reserves the configured capacity before creating sessions.
+
+`--kv-pool-positions N` (Flash-Next HTTP only) enables a Halogen-style shared
+attention KV pool. Sessions keep private SSM/indexer/MTP state and reserve
+contiguous spans from the pool as context grows. `N` must be at least
+`--context`. Example matching Halogen's "two slots share one full context":
+
+```sh
+./result/bin/gufo serve llm --model "$MODEL" --speculative mtp \
+  --mtp-model "$MTP" --sessions 2 --context 262144 \
+  --kv-pool-positions 262144
+```
+
+Unset (`0`, the default) keeps today's private per-session arenas
+(`sessions × context`). YaRN extension beyond the native 262144 is unsupported.
 
 ## Images
 

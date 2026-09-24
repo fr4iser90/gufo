@@ -45,6 +45,9 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
+  /// Shared attention KV positions across sessions (Halogen-style). Zero
+  /// keeps private per-session arenas. Must be >= max_context when set.
+  std::uint32_t kv_pool_positions = 0;
 };
 
 class Session;
@@ -76,6 +79,9 @@ public:
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
+  [[nodiscard]] std::uint32_t KvPoolPositions() const noexcept {
+    return options_.kv_pool_positions;
+  }
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
     return options_.decode_concurrency;
@@ -89,6 +95,7 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  [[nodiscard]] std::size_t AttentionPoolBytes() const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {

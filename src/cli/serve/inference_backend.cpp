@@ -2853,7 +2853,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path) {
+                            const std::string& vision_model_path,
+                            std::uint32_t kv_pool_positions) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -2863,6 +2864,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  if (kv_pool_positions != 0 &&
+      reader->GetMetadataString("general.architecture") != "qwen4exp") {
+    SetError(error,
+             "--kv-pool-positions is only supported for Qwen3.8-Flash-Next");
+    return false;
+  }
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
@@ -2961,6 +2968,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .kv_pool_positions = kv_pool_positions,
         },
         &load_error);
     if (model == nullptr) {
