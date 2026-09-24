@@ -44,6 +44,7 @@ using gufo::server::TextRunnerResourceClaim;
 using gufo::server::TextRunnerState;
 using gufo::server::TextRunnerToken;
 using gufo::server::TextSchedulerPolicy;
+using gufo::server::TextServingSnapshot;
 
 constexpr auto kTestTimeout = std::chrono::seconds{5};
 
@@ -549,6 +550,62 @@ void TestIdlePrefillUsesBulkWorkUnit() {
              result.physical_execution_width == 1 &&
              result.execution_plan == "serial-c1",
          "C=1 telemetry reports immediate serial dispatch");
+}
+
+void TestServingSnapshotReportsRealOccupancy() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_prefill_label = 1;
+  auto scheduler = MakeScheduler(control, 2);
+
+  for (int spin = 0; spin < 200; ++spin) {
+    const auto idle = scheduler->Snapshot();
+    if (idle.session_capacity == 2 && idle.max_context == 128 &&
+        idle.capacity_tokens == 256 && idle.active_sessions == 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  {
+    const auto idle = scheduler->Snapshot();
+    Expect(idle.session_capacity == 2 && idle.max_context == 128 &&
+               idle.capacity_tokens == 256 && idle.queue_capacity == 16 &&
+               idle.active_sessions == 0 && idle.used_tokens == 0 &&
+               idle.slots.size() == 2,
+           "idle snapshot reports real capacity without inventing fill");
+  }
+
+  auto first = scheduler->Submit({1, 10, 11}, 2, 0.0F);
+  control->WaitForPrefill(1);
+  auto second = scheduler->Submit({2}, 2, 0.0F);
+
+  TextServingSnapshot busy;
+  for (int spin = 0; spin < 200; ++spin) {
+    busy = scheduler->Snapshot();
+    if (busy.active_sessions >= 1 && busy.prefilling >= 1) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Expect(busy.active_sessions >= 1 && busy.prefilling >= 1 &&
+             busy.session_capacity == 2 && busy.slots.size() == 2,
+         "busy snapshot reports leased sessions from the scheduler worker");
+  Expect(busy.used_tokens <= busy.capacity_tokens,
+         "used tokens never exceed published capacity");
+
+  control->ReleasePrefill();
+  (void)first.Wait();
+  (void)second.Wait();
+
+  TextServingSnapshot done;
+  for (int spin = 0; spin < 200; ++spin) {
+    done = scheduler->Snapshot();
+    if (done.active_sessions == 0 && done.queued == 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Expect(done.active_sessions == 0 && done.queued == 0 && done.used_tokens == 0,
+         "snapshot returns to empty after requests complete");
 }
 
 void TestRunnerCanSkipUnusedFinalAdvance() {
@@ -1369,6 +1426,7 @@ int main() {
   TestSnapshotDoesNotBlockOtherRequests();
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
+  TestServingSnapshotReportsRealOccupancy();
   TestRunnerCanSkipUnusedFinalAdvance();
   TestRunnerCanReuseExactIncrementalText();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();

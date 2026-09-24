@@ -172,6 +172,7 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
                                    std::memory_order_relaxed);
   detail::LastCompletionTokens().store(result.completion_tokens,
                                        std::memory_order_relaxed);
+  detail::ObserveTtftMs(result.ttft_ms);
 
   const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =

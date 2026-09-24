@@ -1,8 +1,10 @@
 #ifndef GUFO_SERVER_REQUEST_PROGRESS_HPP_
 #define GUFO_SERVER_REQUEST_PROGRESS_HPP_
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -12,6 +14,7 @@
 #include <thread>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/text_generation_backend.hpp"
 
 namespace gufo::server {
 namespace detail {
@@ -39,6 +42,81 @@ inline std::atomic<std::uint64_t>& LastPromptTokens() {
 inline std::atomic<std::uint64_t>& LastCompletionTokens() {
   static std::atomic<std::uint64_t> value{0};
   return value;
+}
+
+inline std::atomic<std::uint64_t>& OccupancySessionsActive() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& OccupancySessionsCapacity() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& OccupancyUsedTokens() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& OccupancyCapacityTokens() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& OccupancyMaxUsedTokens() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint64_t>& OccupancyQueued() {
+  static std::atomic<std::uint64_t> value{0};
+  return value;
+}
+inline std::atomic<std::uint32_t>& OccupancyMaxContext() {
+  static std::atomic<std::uint32_t> value{0};
+  return value;
+}
+
+inline void PublishOccupancyGauges(const TextServingSnapshot& snap) noexcept {
+  OccupancySessionsActive().store(snap.active_sessions,
+                                  std::memory_order_relaxed);
+  OccupancySessionsCapacity().store(snap.session_capacity,
+                                    std::memory_order_relaxed);
+  OccupancyUsedTokens().store(snap.used_tokens, std::memory_order_relaxed);
+  OccupancyCapacityTokens().store(snap.capacity_tokens,
+                                  std::memory_order_relaxed);
+  OccupancyMaxUsedTokens().store(snap.max_used_tokens,
+                                 std::memory_order_relaxed);
+  OccupancyQueued().store(snap.queued, std::memory_order_relaxed);
+  OccupancyMaxContext().store(snap.max_context, std::memory_order_relaxed);
+}
+
+inline constexpr std::array<double, 11> kTtftBucketsMs = {
+    5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+
+inline std::array<std::atomic<std::uint64_t>, 12>& TtftBucketCounts() {
+  static std::array<std::atomic<std::uint64_t>, 12> counts{};
+  return counts;
+}
+inline std::atomic<std::uint64_t>& TtftObservationCount() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TtftSumMicros() {
+  static std::atomic<std::uint64_t> sum{0};
+  return sum;
+}
+
+inline void ObserveTtftMs(double ttft_ms) noexcept {
+  if (!std::isfinite(ttft_ms) || ttft_ms < 0.0) {
+    return;
+  }
+  const auto micros = static_cast<std::uint64_t>(ttft_ms * 1000.0 + 0.5);
+  TtftSumMicros().fetch_add(micros, std::memory_order_relaxed);
+  TtftObservationCount().fetch_add(1, std::memory_order_relaxed);
+  auto& buckets = TtftBucketCounts();
+  for (std::size_t i = 0; i < kTtftBucketsMs.size(); ++i) {
+    if (ttft_ms <= kTtftBucketsMs[i]) {
+      buckets[i].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  buckets.back().fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace detail
@@ -128,7 +206,22 @@ private:
     message << "request=" << request_id_ << " event=progress phase=" << phase
             << " elapsed_ms=" << elapsed_ms
             << " pieces=" << pieces_.load(std::memory_order_relaxed)
-            << " bytes=" << bytes_.load(std::memory_order_relaxed) << ' '
+            << " bytes=" << bytes_.load(std::memory_order_relaxed)
+            << " sessions_active="
+            << detail::OccupancySessionsActive().load(std::memory_order_relaxed)
+            << '/'
+            << detail::OccupancySessionsCapacity().load(
+                   std::memory_order_relaxed)
+            << " context_used="
+            << detail::OccupancyUsedTokens().load(std::memory_order_relaxed)
+            << '/'
+            << detail::OccupancyCapacityTokens().load(std::memory_order_relaxed)
+            << " context_hot="
+            << detail::OccupancyMaxUsedTokens().load(std::memory_order_relaxed)
+            << '/'
+            << detail::OccupancyMaxContext().load(std::memory_order_relaxed)
+            << " queued="
+            << detail::OccupancyQueued().load(std::memory_order_relaxed) << ' '
             << Logger::MemoryStatus();
     Logger::Info("http", message.str());
   }

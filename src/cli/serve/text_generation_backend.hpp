@@ -101,6 +101,35 @@ struct ChatRequest {
   bool cache_prompt{true};
 };
 
+/// Live scheduler occupancy (leased sessions and their CheckpointPositions).
+struct TextServingSnapshot {
+  enum class SlotState : std::uint8_t {
+    kIdle = 0,
+    kPrefilling = 1,
+    kDecoding = 2,
+    kCapturing = 3,
+  };
+
+  struct Slot {
+    std::uint64_t id{0};
+    SlotState state{SlotState::kIdle};
+    std::size_t tokens{0};
+  };
+
+  std::uint32_t max_context{0};
+  std::size_t session_capacity{0};
+  std::size_t active_sessions{0};
+  std::size_t prefilling{0};
+  std::size_t decoding{0};
+  std::size_t capturing{0};
+  std::size_t queued{0};
+  std::size_t queue_capacity{0};
+  std::size_t used_tokens{0};
+  std::size_t capacity_tokens{0};
+  std::size_t max_used_tokens{0};
+  std::vector<Slot> slots;
+};
+
 /// Model-agnostic text generation boundary used by the HTTP transport.
 ///
 /// Implementations retain ownership of tokenization, templates, complete
@@ -203,6 +232,9 @@ public:
 
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
+  [[nodiscard]] virtual TextServingSnapshot serving_snapshot() const {
+    return {};
+  }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }

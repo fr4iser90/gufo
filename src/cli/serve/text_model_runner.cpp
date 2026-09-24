@@ -787,6 +787,14 @@ bool TextRunnerPool::Request::prefill_complete() const noexcept {
   return impl_ != nullptr && impl_->decode_ready;
 }
 
+std::size_t TextRunnerPool::Request::checkpoint_position() const {
+  if (impl_ == nullptr) {
+    return 0;
+  }
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  return impl_->runner->CheckpointPosition(state);
+}
+
 void TextRunnerPool::Request::PrepareBatchExecution() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");

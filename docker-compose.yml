@@ -1,0 +1,104 @@
+# docker-compose.yml: Gufo on Strix Halo (gfx1151).
+#
+# `gufo serve` is the OpenAI-compatible API and the inference engine in one
+# process. The published image is pulled from GHCR; weights stay on the host.
+#
+# Equivalent one-liner (also in the README quickstart):
+#
+#   podman run --rm -it --device /dev/kfd --device /dev/dri \
+#     --group-add keep-groups --ipc=host --ulimit memlock=-1 \
+#     -v /path/to/models:/models:ro -p 8080:8080 \
+#     ghcr.io/gufo-org/toolboxes/gufo-runtime:latest \
+#     gufo serve --host 0.0.0.0 --port 8080 llm \
+#       --model /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf \
+#       --speculative dflash2 \
+#       --dflash-model /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+#
+# ONE VOLUME IS ENOUGH. Point GUFO_MODELS at the directory that holds the
+# downloaded GGUFs (the README quickstart layout under ./models). Paths in
+# GUFO_MODEL / GUFO_DFLASH_MODEL are inside the container, under /models.
+#
+# Gufo is configured by CLI flags. This file maps a small set of environment
+# variables onto that CLI so overrides stay in one place. Do not copy a
+# default into a second place: when the image or the quickstart changes, a
+# stale override here would silently win. Override only what you mean to
+# change; see `gufo serve llm --help` and docs/CLI.md.
+#
+# `keep-groups` in group_add is a PODMAN extension, so this file is written for
+# podman-compose. Under docker compose, replace it with
+# `group_add: ["video", "render"]`.
+#
+# Usage:
+#   GUFO_MODELS=./models podman-compose up -d
+#   podman-compose logs -f gufo          # watch the load, it takes minutes
+#   podman-compose restart gufo          # reloads the model
+services:
+  gufo:
+    image: ${GUFO_IMAGE:-ghcr.io/gufo-org/toolboxes/gufo-runtime:latest}
+    # Shell so the environment block below can drive the CLI without baking
+    # every flag into a second copy of the argv list.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        exec gufo serve
+        --host "$${GUFO_HOST:-0.0.0.0}"
+        --port "$${GUFO_PORT:-8080}"
+        $${GUFO_SESSIONS:+--sessions} $${GUFO_SESSIONS}
+        llm
+        --model "$${GUFO_MODEL:?set GUFO_MODEL to a GGUF path under /models}"
+        $${GUFO_SPECULATIVE:+--speculative} $${GUFO_SPECULATIVE}
+        $${GUFO_DFLASH_MODEL:+--dflash-model} $${GUFO_DFLASH_MODEL}
+        $${GUFO_EXTRA_ARGS}
+    environment:
+      # Bound inside the container. Published host port is under `ports`.
+      GUFO_HOST: 0.0.0.0
+      GUFO_PORT: "8080"
+      #
+      # NOTHING ELSE IS SET AS A HARD DEFAULT ON PURPOSE beyond the README
+      # quickstart model paths. Uncomment to change sessions, drop speculative
+      # decode, or point at another GGUF.
+      #
+      # GUFO_SESSIONS: "2"
+      #
+      # README quickstart (Qwen3.8 27B Q8 + DFlash2). Change these for another
+      # model; clear GUFO_SPECULATIVE and GUFO_DFLASH_MODEL for plain AR.
+      GUFO_MODEL: /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf
+      GUFO_SPECULATIVE: dflash2
+      GUFO_DFLASH_MODEL: /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
+      #
+      # Extra flags appended as-is (e.g. "--context 32768 --verbose").
+      # GUFO_EXTRA_ARGS: "--context 32768"
+    volumes:
+      - ${GUFO_MODELS:?set GUFO_MODELS to the directory that holds the downloaded weights}:/models:ro
+    ports:
+      - "${GUFO_PUBLISH_PORT:-8080}:8080"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # `ipc: host` is load-bearing: without it the GPU runtime dies during
+    # startup, and no `shm_size` substitutes (five sizes from 64 MiB to
+    # 64 GiB fail identically under the same ROCm stack; the shared namespace
+    # itself is what is needed). Same requirement as a bare `podman run
+    # --ipc=host` against this image.
+    ipc: host
+    ulimits:
+      memlock: -1
+    group_add: [keep-groups]
+    # /ready returns 503 until a model is loaded, then 200. That is the check
+    # that matters for "the server can answer", not a bare TCP connect and not
+    # /health alone (liveness without readiness). Reading the weights takes
+    # minutes; start_period buys that time so failures during load do not
+    # count. Needs curl in the runtime image — if your tag lacks it, replace
+    # the test with another HTTP client or drop the block.
+    # If you set --apiKey on the server, this probe must send the same Bearer
+    # token (health/ready are authenticated when a key is configured).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      interval: 10s
+      timeout: 35s
+      retries: 3
+      start_period: 20m
+    # A stop sends SIGTERM and, 10 s later by default, SIGKILL. Give in-flight
+    # requests a minute to finish rather than cutting them mid-decode.
+    stop_grace_period: 60s
+    restart: unless-stopped

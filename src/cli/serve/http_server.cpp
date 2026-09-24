@@ -663,9 +663,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
   RequestProgressLogger progress(req.request_id);
-  const auto res = b.chat(
-      chat, max_tokens, sampling_config, req.is_cancelled,
-      [&](std::string_view piece) { return progress.OnPiece(piece); });
+  const auto res =
+      b.chat(chat, max_tokens, sampling_config, req.is_cancelled,
+             [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -744,9 +744,9 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
   RequestProgressLogger progress(req.request_id);
-  const auto res = b.chat(
-      chat, max_tokens, sampling_config, req.is_cancelled,
-      [&](std::string_view piece) { return progress.OnPiece(piece); });
+  const auto res =
+      b.chat(chat, max_tokens, sampling_config, req.is_cancelled,
+             [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -838,24 +838,47 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   if (model.empty()) {
     model = b.model_id();
   }
+  const auto snap = b.serving_snapshot();
   json::Value resp = json::Value::object();
   resp["model"] = model;
   resp["template"] = "";
   json::Value model_info = json::Value::object();
+  if (snap.max_context > 0) {
+    model_info["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+  }
+  if (snap.session_capacity > 0) {
+    model_info["n_slot"] = snap.session_capacity;
+  }
   resp["model_info"] = std::move(model_info);
+  json::Value defaults = json::Value::object();
+  if (snap.max_context > 0) {
+    defaults["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+  }
+  if (snap.session_capacity > 0) {
+    defaults["n_slot"] = snap.session_capacity;
+  }
+  resp["default_generation_settings"] = std::move(defaults);
   return Ok(resp);
 }
 
 HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
+  const auto snap = b.serving_snapshot();
   json::Value resp = json::Value::array();
-  json::Value slot = json::Value::object();
-  slot["id"] = 0;
-  slot["task_id"] = 0;
-  slot["state"] = 0;
-  slot["prompt"] = "";
-  slot["next_token"] = json::Value();
-  slot["model"] = b.model_id();
-  resp.push_back(std::move(slot));
+  if (snap.slots.empty()) {
+    return Ok(resp);
+  }
+  for (const auto& slot : snap.slots) {
+    json::Value row = json::Value::object();
+    row["id"] = static_cast<std::size_t>(slot.id);
+    row["task_id"] = static_cast<std::size_t>(slot.id);
+    row["state"] = static_cast<int>(slot.state);
+    row["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+    row["n_tokens"] = slot.tokens;
+    row["prompt"] = "";
+    row["next_token"] = json::Value();
+    row["model"] = b.model_id();
+    resp.push_back(std::move(row));
+  }
   return Ok(resp);
 }
 
@@ -880,8 +903,7 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       detail::TotalGenTokens().load(std::memory_order_relaxed);
   const auto prompt_speed =
       detail::LastPromptSpeed().load(std::memory_order_relaxed);
-  const auto gen_speed =
-      detail::LastGenSpeed().load(std::memory_order_relaxed);
+  const auto gen_speed = detail::LastGenSpeed().load(std::memory_order_relaxed);
   const auto active =
       detail::ActiveGenerations().load(std::memory_order_relaxed);
   const auto ttft_ms = detail::LastTtftMs().load(std::memory_order_relaxed);
@@ -891,6 +913,19 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   const auto last_completion =
       detail::LastCompletionTokens().load(std::memory_order_relaxed);
   const auto rss_mib = ProcessRssMiB();
+  const auto snap = b.serving_snapshot();
+  const double session_context_ratio =
+      snap.capacity_tokens > 0 ? static_cast<double>(snap.used_tokens) /
+                                     static_cast<double>(snap.capacity_tokens)
+                               : 0.0;
+  const double sessions_ratio =
+      snap.session_capacity > 0 ? static_cast<double>(snap.active_sessions) /
+                                      static_cast<double>(snap.session_capacity)
+                                : 0.0;
+  const double hot_context_ratio =
+      snap.max_context > 0 ? static_cast<double>(snap.max_used_tokens) /
+                                 static_cast<double>(snap.max_context)
+                           : 0.0;
 
   // Escape model id for Prometheus label values.
   std::string model_label;
@@ -918,13 +953,53 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
          "per second\n"
       << "# TYPE llamacpp:predicted_tokens_seconds gauge\n"
       << "llamacpp:predicted_tokens_seconds " << gen_speed << "\n"
-      << "# HELP llamacpp:kv_cache_usage_ratio KV cache usage ratio\n"
+      << "# HELP llamacpp:kv_cache_usage_ratio Logical fill of preallocated "
+         "per-session context arenas "
+         "(sum of leased CheckpointPosition / (max_context * sessions)); "
+         "not a shared llama.cpp KV cell pool\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
-      << "llamacpp:kv_cache_usage_ratio 0.0\n"
+      << "llamacpp:kv_cache_usage_ratio " << session_context_ratio
+      << "\n"
       // Gufo-native gauges for operators (active work + last request snapshot).
       << "# HELP gufo_generations_active In-flight text generations\n"
       << "# TYPE gufo_generations_active gauge\n"
       << "gufo_generations_active " << active << "\n"
+      << "# HELP gufo_sessions_active Leased scheduler sessions\n"
+      << "# TYPE gufo_sessions_active gauge\n"
+      << "gufo_sessions_active " << snap.active_sessions << "\n"
+      << "# HELP gufo_sessions_capacity Preallocated session pool size\n"
+      << "# TYPE gufo_sessions_capacity gauge\n"
+      << "gufo_sessions_capacity " << snap.session_capacity << "\n"
+      << "# HELP gufo_sessions_usage_ratio active_sessions / session_capacity\n"
+      << "# TYPE gufo_sessions_usage_ratio gauge\n"
+      << "gufo_sessions_usage_ratio " << sessions_ratio << "\n"
+      << "# HELP gufo_requests_queued Requests waiting for a session\n"
+      << "# TYPE gufo_requests_queued gauge\n"
+      << "gufo_requests_queued " << snap.queued << "\n"
+      << "# HELP gufo_requests_queue_capacity Max pending requests\n"
+      << "# TYPE gufo_requests_queue_capacity gauge\n"
+      << "gufo_requests_queue_capacity " << snap.queue_capacity << "\n"
+      << "# HELP gufo_context_tokens_max Max tokens per session\n"
+      << "# TYPE gufo_context_tokens_max gauge\n"
+      << "gufo_context_tokens_max " << snap.max_context << "\n"
+      << "# HELP gufo_session_context_tokens_used Sum of leased session "
+         "positions\n"
+      << "# TYPE gufo_session_context_tokens_used gauge\n"
+      << "gufo_session_context_tokens_used " << snap.used_tokens << "\n"
+      << "# HELP gufo_session_context_tokens_capacity max_context * "
+         "session_capacity\n"
+      << "# TYPE gufo_session_context_tokens_capacity gauge\n"
+      << "gufo_session_context_tokens_capacity " << snap.capacity_tokens << "\n"
+      << "# HELP gufo_session_context_usage_ratio used_tokens / "
+         "capacity_tokens\n"
+      << "# TYPE gufo_session_context_usage_ratio gauge\n"
+      << "gufo_session_context_usage_ratio " << session_context_ratio << "\n"
+      << "# HELP gufo_context_tokens_used_max Hottest leased session position\n"
+      << "# TYPE gufo_context_tokens_used_max gauge\n"
+      << "gufo_context_tokens_used_max " << snap.max_used_tokens << "\n"
+      << "# HELP gufo_context_usage_ratio_max max_used_tokens / max_context\n"
+      << "# TYPE gufo_context_usage_ratio_max gauge\n"
+      << "gufo_context_usage_ratio_max " << hot_context_ratio << "\n"
       << "# HELP gufo_ttft_ms_last Time to first token of the last completed "
          "request\n"
       << "# TYPE gufo_ttft_ms_last gauge\n"
@@ -952,6 +1027,24 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "# HELP gufo_model_info Served model id\n"
       << "# TYPE gufo_model_info gauge\n"
       << "gufo_model_info{model=\"" << model_label << "\"} 1\n";
+
+  const auto ttft_count =
+      detail::TtftObservationCount().load(std::memory_order_relaxed);
+  const auto ttft_sum_ms = static_cast<double>(detail::TtftSumMicros().load(
+                               std::memory_order_relaxed)) /
+                           1000.0;
+  out << "# HELP gufo_ttft_ms Time to first token in milliseconds\n"
+      << "# TYPE gufo_ttft_ms histogram\n";
+  const auto& buckets = detail::TtftBucketCounts();
+  for (std::size_t i = 0; i < detail::kTtftBucketsMs.size(); ++i) {
+    out << "gufo_ttft_ms_bucket{le=\"" << detail::kTtftBucketsMs[i] << "\"} "
+        << buckets[i].load(std::memory_order_relaxed) << "\n";
+  }
+  out << "gufo_ttft_ms_bucket{le=\"+Inf\"} "
+      << buckets.back().load(std::memory_order_relaxed) << "\n"
+      << "gufo_ttft_ms_sum " << ttft_sum_ms << "\n"
+      << "gufo_ttft_ms_count " << ttft_count << "\n";
+
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),

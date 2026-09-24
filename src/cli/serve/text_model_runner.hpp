@@ -351,6 +351,7 @@ public:
     [[nodiscard]] bool cache_disk_hit() const noexcept;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
     [[nodiscard]] bool prefill_complete() const noexcept;
+    [[nodiscard]] std::size_t checkpoint_position() const;
 
     void PrepareBatchExecution();
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);

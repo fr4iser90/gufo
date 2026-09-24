@@ -22,6 +22,7 @@ namespace {
 
 using gufo::server::HttpServer;
 using gufo::server::TextGenerationBackend;
+using gufo::server::TextServingSnapshot;
 
 class FakeBackend final : public TextGenerationBackend {
 public:
@@ -42,6 +43,14 @@ public:
   }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
+  TextServingSnapshot serving_snapshot() const override {
+    const std::lock_guard lock(mutex_);
+    return snapshot_;
+  }
+  void SetServingSnapshot(TextServingSnapshot snapshot) {
+    const std::lock_guard lock(mutex_);
+    snapshot_ = std::move(snapshot);
+  }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
@@ -83,6 +92,8 @@ public:
     result.prefill_ms = 4;
     result.completion_tokens = 1;
     result.decode_ms = 2;
+    result.ttft_ms = 42;
+    result.queue_ms = 3;
     result.finish_reason =
         limit == 1 ? FinishReason::kLength : FinishReason::kStop;
     if (token)
@@ -109,9 +120,10 @@ public:
   std::binary_semaphore finished{0};
 
 private:
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   Call last_;
   std::string output_{"ok"};
+  TextServingSnapshot snapshot_{};
 };
 
 class RunningServer {
@@ -321,6 +333,56 @@ void TestFramingAndMetrics() {
   assert(timings->member_double("cache_n") == 8);
   assert(timings->member_double("prompt_per_second") == 500);
   assert(timings->member_double("prompt_per_token_ms") == 2);
+
+  TextServingSnapshot snap;
+  snap.max_context = 4096;
+  snap.session_capacity = 2;
+  snap.active_sessions = 1;
+  snap.prefilling = 0;
+  snap.decoding = 1;
+  snap.queued = 3;
+  snap.queue_capacity = 16;
+  snap.used_tokens = 1024;
+  snap.capacity_tokens = 8192;
+  snap.max_used_tokens = 1024;
+  snap.slots = {
+      {.id = 7,
+       .state = TextServingSnapshot::SlotState::kDecoding,
+       .tokens = 1024},
+      {.id = 1, .state = TextServingSnapshot::SlotState::kIdle, .tokens = 0}};
+  server.backend->SetServingSnapshot(snap);
+
+  const auto metrics = server.Send("GET /metrics HTTP/1.1\r\n\r\n");
+  ExpectStatus(metrics, 200);
+  assert(metrics.find("text/plain; version=0.0.4") != std::string::npos);
+  assert(metrics.find("llamacpp:kv_cache_usage_ratio 0.0\n") ==
+         std::string::npos);
+  assert(metrics.find("llamacpp:kv_cache_usage_ratio 0.125000\n") !=
+         std::string::npos);
+  assert(metrics.find("gufo_sessions_active 1\n") != std::string::npos);
+  assert(metrics.find("gufo_sessions_capacity 2\n") != std::string::npos);
+  assert(metrics.find("gufo_session_context_tokens_used 1024\n") !=
+         std::string::npos);
+  assert(metrics.find("gufo_ttft_ms_bucket{le=\"+Inf\"}") != std::string::npos);
+  assert(metrics.find("gufo_ttft_ms_count ") != std::string::npos);
+
+  const auto slots_response = server.Send("GET /slots HTTP/1.1\r\n\r\n");
+  ExpectStatus(slots_response, 200);
+  const auto slots = gufo::json::parse(
+      slots_response.substr(slots_response.find("\r\n\r\n") + 4));
+  assert(slots.is_array() && slots.size() == 2);
+  assert(slots.items()[0].member_size("id") == 7);
+  assert(slots.items()[0].member_size("n_tokens") == 1024);
+  assert(slots.items()[0].member_size("state") == 2);
+  assert(slots.items()[1].member_size("state") == 0);
+
+  const auto props_response = server.Send("GET /props HTTP/1.1\r\n\r\n");
+  ExpectStatus(props_response, 200);
+  const auto props = gufo::json::parse(
+      props_response.substr(props_response.find("\r\n\r\n") + 4));
+  const auto* model_info = props.find("model_info");
+  assert(model_info != nullptr && model_info->member_size("n_ctx") == 4096 &&
+         model_info->member_size("n_slot") == 2);
 }
 
 void TestCompatibilityRequests() {
