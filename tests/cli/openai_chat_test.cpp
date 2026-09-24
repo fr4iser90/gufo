@@ -465,6 +465,34 @@ void TestToolCallsAreStructured() {
          "Required tool choice reaches the model backend");
 }
 
+void TestLenientToolsTolerateAgentClients() {
+  FakeBackend backend;
+  // Mix: missing parameters, flat Responses shape, nameless junk, bad type.
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"user","content":"hi"}],
+    "tools":[
+      {"type":"function","function":{"name":"no_params"}},
+      {"type":"function","name":"flat_tool","parameters":{"type":"object"}},
+      {"type":"function","function":{"name":"","parameters":{}}},
+      {"type":"custom","custom":{"name":"x"}},
+      {"type":"function","function":{"name":"ok","parameters":{"type":"object",
+        "properties":{"q":{"type":"string"}}}}}
+    ]
+  })"),
+                                                       backend);
+  Expect(response.status == 200, "incomplete agent tool lists must not 400");
+  Expect(backend.last_request.tools.size() == 3,
+         "valid + normalized tools kept; nameless/unsupported skipped");
+  Expect(backend.last_request.tools[0].name == "no_params" &&
+             backend.last_request.tools[0].parameters_json == "{}",
+         "missing parameters become empty object schema");
+  Expect(backend.last_request.tools[1].name == "flat_tool",
+         "Responses-style flat function tools are accepted");
+  Expect(backend.last_request.tools[2].name == "ok",
+         "complete tools still reach the backend");
+}
+
 void TestQwenToolBoundariesAndSchema() {
   using gufo::json::Value;
   const auto schema = gufo::json::parse(R"({
@@ -1078,6 +1106,7 @@ int main() {
   TestStreamingPromptOpenedReasoning();
   TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
+  TestLenientToolsTolerateAgentClients();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();

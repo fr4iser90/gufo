@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -297,6 +298,9 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   return true;
 }
 
+// Agents (Qwen Code, OpenWebUI, …) often send incomplete tool defs. Rejecting
+// the whole request breaks clients that Halogen/llama tolerate. Skip or
+// normalize bad entries; only fail when `tools` itself is the wrong type.
 bool ParseTools(const json::Value* tools,
                 std::vector<tokenization::ChatTool>* output,
                 std::string* error) {
@@ -308,25 +312,55 @@ bool ParseTools(const json::Value* tools,
     return false;
   }
   for (const auto& item : tools->items()) {
-    if (!item.is_object() || item.member_str("type") != "function") {
-      *error = "only function tools are supported";
-      return false;
+    if (!item.is_object()) {
+      Logger::Warn("http", "skipping non-object tools[] entry");
+      continue;
     }
+    const std::string type = item.member_str("type", "function");
+    if (type != "function") {
+      Logger::Warn("http", "skipping unsupported tools[] type=" + type);
+      continue;
+    }
+
+    // Chat Completions: {type,function:{name,parameters}}
+    // Responses-style flat: {type,name,parameters} (no nested function).
     const json::Value* function = item.find("function");
-    if (function == nullptr || !function->is_object()) {
-      *error = "function tools require a function object";
-      return false;
+    const json::Value* name_src = nullptr;
+    const json::Value* desc_src = nullptr;
+    const json::Value* params_src = nullptr;
+    if (function != nullptr && function->is_object()) {
+      name_src = function;
+      desc_src = function;
+      params_src = function->find("parameters");
+      if (params_src == nullptr || params_src->is_null()) {
+        params_src = function->find("parametersJsonSchema");
+      }
+    } else {
+      name_src = &item;
+      desc_src = &item;
+      params_src = item.find("parameters");
+      if (params_src == nullptr || params_src->is_null()) {
+        params_src = item.find("parametersJsonSchema");
+      }
     }
+
     tokenization::ChatTool tool;
-    tool.name = function->member_str("name");
-    tool.description = function->member_str("description");
-    const json::Value* parameters = function->find("parameters");
-    if (tool.name.empty() || parameters == nullptr ||
-        !parameters->is_object()) {
-      *error = "function tools require a name and object parameters schema";
-      return false;
+    tool.name = name_src->member_str("name");
+    tool.description = desc_src->member_str("description");
+    if (tool.name.empty()) {
+      Logger::Warn("http", "skipping function tool without name");
+      continue;
     }
-    tool.parameters_json = parameters->dump();
+    if (params_src != nullptr && !params_src->is_null() &&
+        !params_src->is_object()) {
+      Logger::Warn("http", "skipping tool '" + tool.name +
+                               "': parameters must be a JSON object schema");
+      continue;
+    }
+    // Missing/null parameters → empty object (no-arg tools).
+    tool.parameters_json = (params_src != nullptr && params_src->is_object())
+                               ? params_src->dump()
+                               : "{}";
     tool.definition_json = item.dump();
     output->push_back(std::move(tool));
   }
