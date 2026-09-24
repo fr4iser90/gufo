@@ -308,20 +308,25 @@ bool ParseTools(const json::Value* tools,
     *error = "'tools' must be an array";
     return false;
   }
+  // Repairable: missing/null parameters → {}, flat Responses-style entries,
+  // and parametersJsonSchema as an alias for parameters. Unrepairable named
+  // tools (non-object parameters) are 400. Junk entries are skipped once.
+  std::size_t skipped = 0;
   for (const auto& item : tools->items()) {
     if (!item.is_object()) {
-      Logger::Warn("http", "skipping non-object tools[] entry");
+      ++skipped;
       continue;
     }
     const std::string type = item.member_str("type", "function");
     if (type != "function") {
-      Logger::Warn("http", "skipping unsupported tools[] type=" + type);
+      ++skipped;
       continue;
     }
 
     const json::Value* function = item.find("function");
     const json::Value* src =
         (function != nullptr && function->is_object()) ? function : &item;
+    // OpenAI uses "parameters"; some agent clients send parametersJsonSchema.
     const json::Value* params_src = src->find("parameters");
     if (params_src == nullptr || params_src->is_null()) {
       params_src = src->find("parametersJsonSchema");
@@ -331,14 +336,13 @@ bool ParseTools(const json::Value* tools,
     tool.name = src->member_str("name");
     tool.description = src->member_str("description");
     if (tool.name.empty()) {
-      Logger::Warn("http", "skipping function tool without name");
+      ++skipped;
       continue;
     }
     if (params_src != nullptr && !params_src->is_null() &&
         !params_src->is_object()) {
-      Logger::Warn("http", "skipping tool '" + tool.name +
-                               "': parameters must be a JSON object schema");
-      continue;
+      *error = "function tools require an object parameters schema";
+      return false;
     }
     tool.parameters_json = (params_src != nullptr && params_src->is_object())
                                ? params_src->dump()
@@ -374,6 +378,10 @@ bool ParseTools(const json::Value* tools,
     }
     tool.definition_json = definition.dump();
     output->push_back(std::move(tool));
+  }
+  if (skipped != 0) {
+    Logger::Warn("http", "skipped " + std::to_string(skipped) +
+                             " invalid tools[] entries");
   }
   return true;
 }

@@ -492,7 +492,36 @@ void TestLenientToolsTolerateAgentClients() {
   Expect(backend.last_request.tools[2].name == "ok",
          "complete tools still reach the backend");
 
-  for (const auto& tool : backend.last_request.tools) {
+  const auto kept_tools = backend.last_request.tools;
+  const auto kept_messages = backend.last_request.messages;
+
+  // Named tool with non-object parameters is not repairable → 400.
+  const auto bad_params = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"user","content":"hi"}],
+    "tools":[{"type":"function","function":{"name":"bad","parameters":"nope"}}]
+  })"),
+                                                         backend);
+  Expect(bad_params.status == 400 &&
+             bad_params.body.find("invalid_tools") != std::string::npos,
+         "named tools with non-object parameters are rejected");
+
+  // parametersJsonSchema alias (some agent clients).
+  FakeBackend alias_backend;
+  const auto alias = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"user","content":"hi"}],
+    "tools":[{"type":"function","function":{"name":"alias",
+      "parametersJsonSchema":{"type":"object","properties":{"x":{"type":"string"}}}}}]
+  })"),
+                                                    alias_backend);
+  Expect(alias.status == 200 && alias_backend.last_request.tools.size() == 1 &&
+             alias_backend.last_request.tools[0].name == "alias" &&
+             alias_backend.last_request.tools[0].parameters_json.find(
+                 "\"x\"") != std::string::npos,
+         "parametersJsonSchema is accepted as a parameters alias");
+
+  for (const auto& tool : kept_tools) {
     const auto definition = gufo::json::parse(tool.definition_json);
     const auto* function = definition.find("function");
     Expect(definition.member_str("type") == "function" && function != nullptr &&
@@ -506,7 +535,7 @@ void TestLenientToolsTolerateAgentClients() {
   gufo::tokenization::ChatTemplateOptions options;
   options.enable_thinking = false;
   const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
-      backend.last_request.messages, backend.last_request.tools, options);
+      kept_messages, kept_tools, options);
   Expect(rendered.has_value(), "Qwen template renders lenient tools");
   Expect(
       rendered->find(
@@ -524,7 +553,7 @@ void TestLenientToolsTolerateAgentClients() {
 
   // DS4 extracts definition_json["function"]; a flat dump makes operator[]
   // insert null and poison the tool list.
-  for (const auto& tool : backend.last_request.tools) {
+  for (const auto& tool : kept_tools) {
     const auto root = gufo::json::parse(tool.definition_json);
     const auto* function = root.find("function");
     Expect(function != nullptr && function->is_object() &&
