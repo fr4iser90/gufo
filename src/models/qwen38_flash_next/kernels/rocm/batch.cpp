@@ -676,6 +676,12 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             item.session->max_context_) {
       return Fail(error, "invalid session or chain in decode batch");
     }
+    if (!EnsureSessionKv(*item.session,
+                         item.session->position_ +
+                             static_cast<std::uint32_t>(item.tokens.size()),
+                         error)) {
+      return false;
+    }
     for (std::size_t j = 0; j < i; ++j) {
       if (items[j].session == item.session) {
         return Fail(error, "decode batch contains a duplicate session");

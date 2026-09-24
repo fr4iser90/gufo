@@ -5,8 +5,10 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -132,6 +134,9 @@ std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
 }  // namespace
 
 Session::~Session() {
+  if (owner_ != nullptr && kv_pooled_) {
+    owner_->ReleaseSessionKv(*this);
+  }
   TrimRollback(0);
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
@@ -264,6 +269,18 @@ Executor::~Executor() {
   (void)hipHostFree(batch_gdn_host_);
   (void)hipHostFree(batch_controls_);
   (void)hipHostFree(batch_candidates_host_);
+  if (attention_pool_ != nullptr) {
+    for (auto* p : attention_pool_->k) {
+      (void)hipFree(p);
+    }
+    for (auto* p : attention_pool_->v) {
+      (void)hipFree(p);
+    }
+    for (auto* p : attention_pool_->block_k) {
+      (void)hipFree(p);
+    }
+    attention_pool_.reset();
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -488,6 +505,49 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
   }
+  if (options.kv_pool_positions > 0) {
+    const Config& c = model.config();
+    auto pool =
+        std::make_unique<SharedAttentionPool>(options.kv_pool_positions);
+    pool->layer_index.assign(c.num_layers,
+                             std::numeric_limits<std::uint32_t>::max());
+    const std::size_t kv_row = c.AttentionKvDim();
+    const std::size_t positions = options.kv_pool_positions;
+    const std::size_t block_rows = positions / c.compress_ratio + 1;
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsLinearLayer(il)) {
+        continue;
+      }
+      const auto slot = static_cast<std::uint32_t>(pool->k.size());
+      pool->layer_index[il] = slot;
+      void* k = nullptr;
+      void* v = nullptr;
+      void* block = nullptr;
+      const std::size_t kv_bytes = positions * kv_row * sizeof(__half);
+      const std::size_t block_bytes =
+          block_rows * c.indexer_head_dim * sizeof(__half);
+      if (!Check(hipMalloc(&k, kv_bytes), "shared k pool", error_msg) ||
+          !Check(hipMalloc(&v, kv_bytes), "shared v pool", error_msg) ||
+          !Check(hipMalloc(&block, block_bytes), "shared block_k pool",
+                 error_msg)) {
+        (void)hipFree(k);
+        (void)hipFree(v);
+        (void)hipFree(block);
+        return nullptr;
+      }
+      (void)hipMemset(k, 0, kv_bytes);
+      (void)hipMemset(v, 0, kv_bytes);
+      (void)hipMemset(block, 0, block_bytes);
+      pool->k.push_back(static_cast<__half*>(k));
+      pool->v.push_back(static_cast<__half*>(v));
+      pool->block_k.push_back(static_cast<__half*>(block));
+      pool->bytes += kv_bytes * 2 + block_bytes;
+    }
+    if (!Check(hipDeviceSynchronize(), "shared kv pool init", error_msg)) {
+      return nullptr;
+    }
+    e->attention_pool_ = std::move(pool);
+  }
   return e;
 }
 
@@ -506,7 +566,14 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     AssignError(error_msg, "session context exceeds the model context");
     return nullptr;
   }
+  if (attention_pool_ != nullptr &&
+      max_context > attention_pool_->positions.capacity()) {
+    AssignError(error_msg,
+                "session context exceeds the shared attention KV pool");
+    return nullptr;
+  }
   s->max_context_ = max_context;
+  s->kv_pooled_ = attention_pool_ != nullptr;
   // Before sparse attention starts, pooling can lag by indexer_top_k
   // rows. Afterwards only an incomplete block precedes the current batch.
   // Completed block keys remain in block_k; their raw rows are dead.
@@ -527,19 +594,21 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      at.k_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
-      at.v_cache =
-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                        error_msg, &s->allocated_bytes_);
+      if (!s->kv_pooled_) {
+        at.k_cache =
+            Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
+                          error_msg, &s->allocated_bytes_);
+        at.v_cache =
+            Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
+                          error_msg, &s->allocated_bytes_);
+        at.block_k = Alloc<__half>(
+            a,
+            static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
+                c.indexer_head_dim,
+            error_msg, &s->allocated_bytes_);
+      }
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
-          error_msg, &s->allocated_bytes_);
-      at.block_k = Alloc<__half>(
-          a,
-          static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
-              c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
     }
   }
@@ -644,6 +713,13 @@ std::size_t Executor::SessionBytes(
           c.indexer_head_dim * sizeof(float) +
       std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
           sizeof(__half);
+  // Shared pools own trunk KV + block_k; sessions still keep the indexer ring
+  // and speculative MTP caches privately.
+  const std::size_t private_index =
+      std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
+      c.indexer_head_dim * sizeof(float);
+  const std::size_t attention_private =
+      attention_pool_ != nullptr ? private_index : (kv + index);
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -653,12 +729,179 @@ std::size_t Executor::SessionBytes(
   return ((linear * conv + ple) * (rollback_depth + 1) +
           linear * (state + rollback_state)) *
              sizeof(float) +
-         attention * (kv + index) + sizeof(Session::Control) +
+         attention * attention_private + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
               ? kv + index +
                     std::size_t{options_.max_speculative + 1} * c.HcDim() *
                         sizeof(float)
               : 0);
+}
+
+std::size_t Executor::AttentionPoolBytes() const noexcept {
+  return attention_pool_ != nullptr ? attention_pool_->bytes : 0;
+}
+
+std::uint32_t Executor::kv_pool_used() const noexcept {
+  if (attention_pool_ == nullptr) {
+    return 0;
+  }
+  const std::lock_guard<std::mutex> lock(attention_pool_->mutex);
+  return attention_pool_->positions.used();
+}
+
+void Executor::BindSessionKv(Session& session) const {
+  if (attention_pool_ == nullptr || !session.kv_pooled_) {
+    return;
+  }
+  const Config& c = config();
+  const std::size_t kv_row = c.AttentionKvDim();
+  const std::size_t block_dim = c.indexer_head_dim;
+  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+    if (c.IsLinearLayer(il)) {
+      continue;
+    }
+    const auto slot = attention_pool_->layer_index[il];
+    auto& at = session.attention_[il];
+    at.k_cache = attention_pool_->k[slot] +
+                 static_cast<std::size_t>(session.kv_base_) * kv_row;
+    at.v_cache = attention_pool_->v[slot] +
+                 static_cast<std::size_t>(session.kv_base_) * kv_row;
+    at.block_k = attention_pool_->block_k[slot] +
+                 static_cast<std::size_t>(session.kv_base_ / c.compress_ratio) *
+                     block_dim;
+  }
+}
+
+void Executor::ReleaseSessionKv(Session& session) const {
+  if (attention_pool_ == nullptr || !session.kv_pooled_ ||
+      session.kv_reserved_ == 0) {
+    return;
+  }
+  const std::lock_guard<std::mutex> lock(attention_pool_->mutex);
+  attention_pool_->positions.Release(session.kv_base_, session.kv_reserved_);
+  session.kv_base_ = 0;
+  session.kv_reserved_ = 0;
+  for (auto& at : session.attention_) {
+    at.k_cache = nullptr;
+    at.v_cache = nullptr;
+    at.block_k = nullptr;
+  }
+}
+
+bool Executor::EnsureSessionKv(Session& session, std::uint32_t need,
+                               std::string* error_msg) const {
+  if (attention_pool_ == nullptr || !session.kv_pooled_) {
+    return true;
+  }
+  if (need == 0) {
+    return true;
+  }
+  if (need > session.max_context_) {
+    AssignError(error_msg, "session context is full");
+    return false;
+  }
+  const std::lock_guard<std::mutex> lock(attention_pool_->mutex);
+  if (session.kv_reserved_ >= need) {
+    return true;
+  }
+  const Config& c = config();
+  const std::size_t kv_row = c.AttentionKvDim();
+  auto copy_rows = [&](std::uint32_t from_base, std::uint32_t to_base,
+                       std::uint32_t rows) -> bool {
+    if (rows == 0) {
+      return true;
+    }
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (c.IsLinearLayer(il)) {
+        continue;
+      }
+      const auto slot = attention_pool_->layer_index[il];
+      const std::size_t kv_bytes =
+          static_cast<std::size_t>(rows) * kv_row * sizeof(__half);
+      const std::size_t block_rows =
+          (rows + c.compress_ratio - 1) / c.compress_ratio;
+      const std::size_t block_bytes =
+          block_rows * c.indexer_head_dim * sizeof(__half);
+      if (!Check(hipMemcpy(attention_pool_->k[slot] +
+                               static_cast<std::size_t>(to_base) * kv_row,
+                           attention_pool_->k[slot] +
+                               static_cast<std::size_t>(from_base) * kv_row,
+                           kv_bytes, hipMemcpyDeviceToDevice),
+                 "kv pool relocate k", error_msg) ||
+          !Check(hipMemcpy(attention_pool_->v[slot] +
+                               static_cast<std::size_t>(to_base) * kv_row,
+                           attention_pool_->v[slot] +
+                               static_cast<std::size_t>(from_base) * kv_row,
+                           kv_bytes, hipMemcpyDeviceToDevice),
+                 "kv pool relocate v", error_msg) ||
+          !Check(
+              hipMemcpy(
+                  attention_pool_->block_k[slot] +
+                      static_cast<std::size_t>(to_base / c.compress_ratio) *
+                          c.indexer_head_dim,
+                  attention_pool_->block_k[slot] +
+                      static_cast<std::size_t>(from_base / c.compress_ratio) *
+                          c.indexer_head_dim,
+                  block_bytes, hipMemcpyDeviceToDevice),
+              "kv pool relocate block_k", error_msg)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (session.kv_reserved_ == 0) {
+    std::uint32_t base = 0;
+    const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
+    auto align = [ratio](std::uint32_t n) {
+      return ((n + ratio - 1) / ratio) * ratio;
+    };
+    std::uint32_t want = align(session.max_context_);
+    if (want > attention_pool_->positions.capacity()) {
+      want = align(need);
+    }
+    if (!attention_pool_->positions.Reserve(want, &base)) {
+      want = align(need);
+      if (want < need) {
+        want = need;
+      }
+      if (!attention_pool_->positions.Reserve(want, &base)) {
+        AssignError(error_msg, "shared attention KV pool is exhausted");
+        return false;
+      }
+    }
+    session.kv_base_ = base;
+    session.kv_reserved_ = want;
+    BindSessionKv(session);
+    return true;
+  }
+  const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
+  const std::uint32_t grow_to = ((need + ratio - 1) / ratio) * ratio;
+  if (attention_pool_->positions.TryGrow(session.kv_base_, session.kv_reserved_,
+                                         grow_to)) {
+    session.kv_reserved_ = grow_to;
+    return true;
+  }
+  std::uint32_t new_base = 0;
+  std::uint32_t want = ((session.max_context_ + ratio - 1) / ratio) * ratio;
+  if (want > attention_pool_->positions.capacity() ||
+      !attention_pool_->positions.Reserve(want, &new_base)) {
+    want = grow_to;
+    if (!attention_pool_->positions.Reserve(want, &new_base)) {
+      AssignError(error_msg, "shared attention KV pool is exhausted");
+      return false;
+    }
+  }
+  const std::uint32_t live = std::min(session.position_, session.kv_reserved_);
+  if (!copy_rows(session.kv_base_, new_base, live)) {
+    attention_pool_->positions.Release(new_base, want);
+    return false;
+  }
+  attention_pool_->positions.Release(session.kv_base_, session.kv_reserved_);
+  session.kv_base_ = new_base;
+  session.kv_reserved_ = want;
+  BindSessionKv(session);
+  return true;
 }
 
 std::size_t Executor::DeferredScratchBytes() const {
@@ -1810,6 +2053,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "session context is full");
     return false;
   }
+  if (!EnsureSessionKv(session, session.position_ + n, error_msg)) {
+    return false;
+  }
   for (auto t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size) {
       AssignError(error_msg, "token out of range");
@@ -2349,6 +2595,9 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   if (h.position - h.blocks * h.compress_ratio > session.index_capacity_) {
     AssignError(error_msg, "unpooled indexer rows exceed the ring capacity");
+    return false;
+  }
+  if (!EnsureSessionKv(session, h.position, error_msg)) {
     return false;
   }
   if (h.payload_bytes != payload.size() ||

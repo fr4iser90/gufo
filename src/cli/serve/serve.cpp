@@ -892,6 +892,7 @@ int RunServe(std::span<const char* const> args) {
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
     std::string served_model_name;
     std::uint32_t max_context = 4096;
+    std::uint32_t kv_pool_positions = 0;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
@@ -938,6 +939,10 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("-c", "--context", "N",
                          "Maximum context tokens (default: 4096)", "Model",
                          &max_context);
+    llm_parser.AddOption(
+        "", "--kv-pool-positions", "N",
+        "Shared attention KV positions for Flash-Next (0=private arenas)",
+        "Model", &kv_pool_positions);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default maximum new tokens per response (default: 128)",
@@ -1134,7 +1139,7 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path)) {
+                       vision_model_path, kv_pool_positions)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
@@ -1151,8 +1156,10 @@ int RunServe(std::span<const char* const> args) {
             : "off";
     load_log.Complete(
         "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(max_context) + " speculative=" + speculation +
+        " sessions=" + std::to_string(session_count) +
+        " context_tokens=" + std::to_string(max_context) +
+        " kv_pool_positions=" + std::to_string(kv_pool_positions) +
+        " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
   }
