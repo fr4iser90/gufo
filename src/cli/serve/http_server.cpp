@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -592,8 +593,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.complete(
+      prompt, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); },
+      req.client_id);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -658,7 +662,10 @@ HttpResponse OpenAiResponses(const HttpRequest& req,
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
+  RequestProgressLogger progress(req.request_id);
+  const auto res =
+      b.chat(chat, max_tokens, sampling_config, req.is_cancelled,
+             [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -736,7 +743,10 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
 
   ChatRequest chat{std::move(messages)};
   chat.client_id = req.client_id;
-  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
+  RequestProgressLogger progress(req.request_id);
+  const auto res =
+      b.chat(chat, max_tokens, sampling_config, req.is_cancelled,
+             [&](std::string_view piece) { return progress.OnPiece(piece); });
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -793,8 +803,11 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   }
   const std::string prompt = input->str();
 
-  const auto res = b.complete(prompt, max_tokens, sampling_config,
-                              req.is_cancelled, {}, req.client_id);
+  RequestProgressLogger progress(req.request_id);
+  const auto res = b.complete(
+      prompt, max_tokens, sampling_config, req.is_cancelled,
+      [&](std::string_view piece) { return progress.OnPiece(piece); },
+      req.client_id);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -820,56 +833,223 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
-  const std::string model = req.query_param("model");
+HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
+  std::string model = req.query_param("model");
   if (model.empty()) {
-    return Err(400, "Bad Request", "'model' query parameter is required",
-               "invalid_request_error", "missing_model");
+    model = b.model_id();
   }
+  const auto snap = b.serving_snapshot();
   json::Value resp = json::Value::object();
   resp["model"] = model;
   resp["template"] = "";
   json::Value model_info = json::Value::object();
+  if (snap.max_context > 0) {
+    model_info["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+  }
+  if (snap.session_capacity > 0) {
+    model_info["n_slot"] = snap.session_capacity;
+  }
   resp["model_info"] = std::move(model_info);
+  json::Value defaults = json::Value::object();
+  if (snap.max_context > 0) {
+    defaults["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+  }
+  if (snap.session_capacity > 0) {
+    defaults["n_slot"] = snap.session_capacity;
+  }
+  resp["default_generation_settings"] = std::move(defaults);
   return Ok(resp);
 }
 
 HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
+  const auto snap = b.serving_snapshot();
   json::Value resp = json::Value::array();
-  json::Value slot = json::Value::object();
-  slot["id"] = 0;
-  slot["task_id"] = 0;
-  slot["state"] = 0;
-  slot["prompt"] = "";
-  slot["next_token"] = json::Value();
-  slot["model"] = b.model_id();
-  resp.push_back(std::move(slot));
+  if (snap.slots.empty()) {
+    return Ok(resp);
+  }
+  for (const auto& slot : snap.slots) {
+    json::Value row = json::Value::object();
+    row["id"] = static_cast<std::size_t>(slot.id);
+    row["task_id"] = static_cast<std::size_t>(slot.id);
+    row["state"] = static_cast<int>(slot.state);
+    row["n_ctx"] = static_cast<std::size_t>(snap.max_context);
+    row["n_tokens"] = slot.tokens;
+    row["prompt"] = "";
+    row["next_token"] = json::Value();
+    row["model"] = b.model_id();
+    resp.push_back(std::move(row));
+  }
   return Ok(resp);
 }
 
-HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend&) {
+std::size_t ProcessRssMiB() {
+  std::ifstream input("/proc/self/status");
+  for (std::string line; std::getline(input, line);) {
+    if (line.starts_with("VmRSS:")) {
+      std::istringstream value(line.substr(6));
+      std::size_t kib = 0;
+      if (value >> kib) {
+        return kib / 1024;
+      }
+    }
+  }
+  return 0;
+}
+
+HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
+  const auto prompt_total =
+      detail::TotalPromptTokens().load(std::memory_order_relaxed);
+  const auto gen_total =
+      detail::TotalGenTokens().load(std::memory_order_relaxed);
+  const auto prompt_speed =
+      detail::LastPromptSpeed().load(std::memory_order_relaxed);
+  const auto gen_speed = detail::LastGenSpeed().load(std::memory_order_relaxed);
+  const auto active =
+      detail::ActiveGenerations().load(std::memory_order_relaxed);
+  const auto ttft_ms = detail::LastTtftMs().load(std::memory_order_relaxed);
+  const auto queue_ms = detail::LastQueueMs().load(std::memory_order_relaxed);
+  const auto last_prompt =
+      detail::LastPromptTokens().load(std::memory_order_relaxed);
+  const auto last_completion =
+      detail::LastCompletionTokens().load(std::memory_order_relaxed);
+  const auto rss_mib = ProcessRssMiB();
+  const auto snap = b.serving_snapshot();
+  const double session_context_ratio =
+      snap.capacity_tokens > 0 ? static_cast<double>(snap.used_tokens) /
+                                     static_cast<double>(snap.capacity_tokens)
+                               : 0.0;
+  const double sessions_ratio =
+      snap.session_capacity > 0 ? static_cast<double>(snap.active_sessions) /
+                                      static_cast<double>(snap.session_capacity)
+                                : 0.0;
+  const double hot_context_ratio =
+      snap.max_context > 0 ? static_cast<double>(snap.max_used_tokens) /
+                                 static_cast<double>(snap.max_context)
+                           : 0.0;
+
+  // Escape model id for Prometheus label values.
+  std::string model_label;
+  for (const unsigned char c : b.model_id()) {
+    if (c == '\\' || c == '"') {
+      model_label += '\\';
+    }
+    model_label += static_cast<char>(c);
+  }
+
   std::ostringstream out;
+  out << std::fixed;
+  // llama.cpp-compatible names kept for existing scrapers / Open WebUI.
   out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed\n"
       << "# TYPE llamacpp:prompt_tokens_total counter\n"
-      << "llamacpp:prompt_tokens_total "
-      << detail::TotalPromptTokens().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_tokens_total " << prompt_total << "\n"
       << "# HELP llamacpp:tokens_predicted_total Total tokens generated\n"
       << "# TYPE llamacpp:tokens_predicted_total counter\n"
-      << "llamacpp:tokens_predicted_total "
-      << detail::TotalGenTokens().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:tokens_predicted_total " << gen_total << "\n"
       << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
          "tokens per second\n"
       << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
-      << "llamacpp:prompt_tokens_seconds "
-      << detail::LastPromptSpeed().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_tokens_seconds " << prompt_speed << "\n"
       << "# HELP llamacpp:predicted_tokens_seconds Generation speed in tokens "
          "per second\n"
       << "# TYPE llamacpp:predicted_tokens_seconds gauge\n"
-      << "llamacpp:predicted_tokens_seconds "
-      << detail::LastGenSpeed().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:kv_cache_usage_ratio KV cache usage ratio\n"
+      << "llamacpp:predicted_tokens_seconds " << gen_speed << "\n"
+      << "# HELP llamacpp:kv_cache_usage_ratio Logical fill of preallocated "
+         "per-session context arenas "
+         "(leased CheckpointPosition + idle retained prefixes) / "
+         "(max_context * sessions); not a shared llama.cpp KV cell pool\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
-      << "llamacpp:kv_cache_usage_ratio 0.0\n";
+      << "llamacpp:kv_cache_usage_ratio " << session_context_ratio
+      << "\n"
+      // Gufo-native gauges for operators (active work + last request snapshot).
+      << "# HELP gufo_generations_active In-flight text generations\n"
+      << "# TYPE gufo_generations_active gauge\n"
+      << "gufo_generations_active " << active << "\n"
+      << "# HELP gufo_sessions_active Leased scheduler sessions\n"
+      << "# TYPE gufo_sessions_active gauge\n"
+      << "gufo_sessions_active " << snap.active_sessions << "\n"
+      << "# HELP gufo_sessions_capacity Preallocated session pool size\n"
+      << "# TYPE gufo_sessions_capacity gauge\n"
+      << "gufo_sessions_capacity " << snap.session_capacity << "\n"
+      << "# HELP gufo_sessions_usage_ratio active_sessions / session_capacity\n"
+      << "# TYPE gufo_sessions_usage_ratio gauge\n"
+      << "gufo_sessions_usage_ratio " << sessions_ratio << "\n"
+      << "# HELP gufo_requests_queued Requests waiting for a session\n"
+      << "# TYPE gufo_requests_queued gauge\n"
+      << "gufo_requests_queued " << snap.queued << "\n"
+      << "# HELP gufo_requests_queue_capacity Max pending requests\n"
+      << "# TYPE gufo_requests_queue_capacity gauge\n"
+      << "gufo_requests_queue_capacity " << snap.queue_capacity << "\n"
+      << "# HELP gufo_context_tokens_max Max tokens per session\n"
+      << "# TYPE gufo_context_tokens_max gauge\n"
+      << "gufo_context_tokens_max " << snap.max_context << "\n"
+      << "# HELP gufo_session_context_tokens_used Leased positions plus idle "
+         "retained prefixes\n"
+      << "# TYPE gufo_session_context_tokens_used gauge\n"
+      << "gufo_session_context_tokens_used " << snap.used_tokens << "\n"
+      << "# HELP gufo_session_context_tokens_retained_idle Idle cache entries' "
+         "retained arena fill\n"
+      << "# TYPE gufo_session_context_tokens_retained_idle gauge\n"
+      << "gufo_session_context_tokens_retained_idle "
+      << snap.retained_idle_tokens << "\n"
+      << "# HELP gufo_session_context_tokens_capacity max_context * "
+         "session_capacity\n"
+      << "# TYPE gufo_session_context_tokens_capacity gauge\n"
+      << "gufo_session_context_tokens_capacity " << snap.capacity_tokens << "\n"
+      << "# HELP gufo_session_context_usage_ratio used_tokens / "
+         "capacity_tokens\n"
+      << "# TYPE gufo_session_context_usage_ratio gauge\n"
+      << "gufo_session_context_usage_ratio " << session_context_ratio << "\n"
+      << "# HELP gufo_context_tokens_used_max Hottest leased session position\n"
+      << "# TYPE gufo_context_tokens_used_max gauge\n"
+      << "gufo_context_tokens_used_max " << snap.max_used_tokens << "\n"
+      << "# HELP gufo_context_usage_ratio_max max_used_tokens / max_context\n"
+      << "# TYPE gufo_context_usage_ratio_max gauge\n"
+      << "gufo_context_usage_ratio_max " << hot_context_ratio << "\n"
+      << "# HELP gufo_ttft_ms_last Time to first token of the last completed "
+         "request\n"
+      << "# TYPE gufo_ttft_ms_last gauge\n"
+      << "gufo_ttft_ms_last " << ttft_ms << "\n"
+      << "# HELP gufo_queue_ms_last Queue wait of the last completed request\n"
+      << "# TYPE gufo_queue_ms_last gauge\n"
+      << "gufo_queue_ms_last " << queue_ms << "\n"
+      << "# HELP gufo_prompt_tokens_last Prompt tokens of the last completed "
+         "request\n"
+      << "# TYPE gufo_prompt_tokens_last gauge\n"
+      << "gufo_prompt_tokens_last " << last_prompt << "\n"
+      << "# HELP gufo_completion_tokens_last Completion tokens of the last "
+         "completed request\n"
+      << "# TYPE gufo_completion_tokens_last gauge\n"
+      << "gufo_completion_tokens_last " << last_completion << "\n"
+      << "# HELP gufo_prompt_tokens_seconds Last observed prefill tokens/s\n"
+      << "# TYPE gufo_prompt_tokens_seconds gauge\n"
+      << "gufo_prompt_tokens_seconds " << prompt_speed << "\n"
+      << "# HELP gufo_predicted_tokens_seconds Last observed decode tokens/s\n"
+      << "# TYPE gufo_predicted_tokens_seconds gauge\n"
+      << "gufo_predicted_tokens_seconds " << gen_speed << "\n"
+      << "# HELP gufo_process_resident_memory_mib Process RSS in MiB\n"
+      << "# TYPE gufo_process_resident_memory_mib gauge\n"
+      << "gufo_process_resident_memory_mib " << rss_mib << "\n"
+      << "# HELP gufo_model_info Served model id\n"
+      << "# TYPE gufo_model_info gauge\n"
+      << "gufo_model_info{model=\"" << model_label << "\"} 1\n";
+
+  const auto ttft_count =
+      detail::TtftObservationCount().load(std::memory_order_relaxed);
+  const auto ttft_sum_ms = static_cast<double>(detail::TtftSumMicros().load(
+                               std::memory_order_relaxed)) /
+                           1000.0;
+  out << "# HELP gufo_ttft_ms Time to first token in milliseconds\n"
+      << "# TYPE gufo_ttft_ms histogram\n";
+  const auto& buckets = detail::TtftBucketCounts();
+  for (std::size_t i = 0; i < detail::kTtftBucketsMs.size(); ++i) {
+    out << "gufo_ttft_ms_bucket{le=\"" << detail::kTtftBucketsMs[i] << "\"} "
+        << buckets[i].load(std::memory_order_relaxed) << "\n";
+  }
+  out << "gufo_ttft_ms_bucket{le=\"+Inf\"} "
+      << buckets.back().load(std::memory_order_relaxed) << "\n"
+      << "gufo_ttft_ms_sum " << ttft_sum_ms << "\n"
+      << "gufo_ttft_ms_count " << ttft_count << "\n";
+
   return {.status = 200,
           .reason = "OK",
           .body = out.str(),

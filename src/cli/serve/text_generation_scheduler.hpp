@@ -108,6 +108,7 @@ public:
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
+  [[nodiscard]] TextServingSnapshot Snapshot() const noexcept;
 
   [[nodiscard]] Request Submit(std::vector<TextRunnerToken> prompt,
                                std::size_t max_tokens,

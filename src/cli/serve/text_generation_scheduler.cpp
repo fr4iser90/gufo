@@ -14,6 +14,8 @@
 #include <thread>
 #include <utility>
 
+#include "src/cli/serve/request_progress.hpp"
+
 namespace gufo::server {
 namespace {
 
@@ -224,6 +226,7 @@ struct TextGenerationScheduler::Impl {
             .capabilities.batched_multi_token_decode_max_width;
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
+    PublishOccupancy({}, {}, {});
   }
 
   ~Impl() {
@@ -236,6 +239,7 @@ struct TextGenerationScheduler::Impl {
     if (worker.joinable()) {
       worker.join();
     }
+    PublishOccupancy({}, {}, {});
   }
 
   Impl(const Impl&) = delete;
@@ -1003,6 +1007,76 @@ struct TextGenerationScheduler::Impl {
     decoding.clear();
   }
 
+  void PublishOccupancy(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      const std::deque<std::shared_ptr<ScheduledRequest>>& capturing) noexcept {
+    TextServingSnapshot snap;
+    snap.max_context = runner_pool->runner().Descriptor().max_context;
+    snap.session_capacity = runner_pool->capacity();
+    snap.prefilling = prefilling.size();
+    snap.decoding = decoding.size();
+    snap.capturing = capturing.size();
+    snap.active_sessions = snap.prefilling + snap.decoding + snap.capturing;
+    snap.queue_capacity = scheduler_policy.max_pending_requests;
+    snap.capacity_tokens =
+        static_cast<std::size_t>(snap.max_context) * snap.session_capacity;
+    {
+      const std::lock_guard<std::mutex> lock(queue_mutex);
+      snap.queued = queued_count;
+    }
+
+    const auto cache_occ = runner_pool->cache_occupancy();
+    snap.slots.assign(snap.session_capacity, {});
+    for (std::size_t index = 0; index < snap.session_capacity; ++index) {
+      TextServingSnapshot::Slot slot;
+      slot.id = index;
+      slot.state = TextServingSnapshot::SlotState::kIdle;
+      if (index < cache_occ.size() && cache_occ[index].available) {
+        slot.tokens = cache_occ[index].retained_tokens;
+      }
+      snap.slots[index] = slot;
+    }
+
+    const auto overlay_active =
+        [&](const std::deque<std::shared_ptr<ScheduledRequest>>& requests,
+            TextServingSnapshot::SlotState state) noexcept {
+          for (const auto& request : requests) {
+            std::size_t index = 0;
+            std::size_t tokens = 0;
+            try {
+              index = request->runner_request.lease_index();
+              tokens = request->runner_request.checkpoint_position();
+            } catch (...) {
+              continue;
+            }
+            if (index >= snap.slots.size()) {
+              continue;
+            }
+            snap.slots[index] = {.id = request->id,
+                                 .state = state,
+                                 .tokens = tokens};
+          }
+        };
+    overlay_active(prefilling, TextServingSnapshot::SlotState::kPrefilling);
+    overlay_active(decoding, TextServingSnapshot::SlotState::kDecoding);
+    overlay_active(capturing, TextServingSnapshot::SlotState::kCapturing);
+
+    for (const auto& slot : snap.slots) {
+      snap.used_tokens += slot.tokens;
+      snap.max_used_tokens = std::max(snap.max_used_tokens, slot.tokens);
+      if (slot.state == TextServingSnapshot::SlotState::kIdle) {
+        snap.retained_idle_tokens += slot.tokens;
+      }
+    }
+
+    {
+      const std::lock_guard<std::mutex> lock(occupancy_mutex);
+      occupancy = snap;
+    }
+    detail::PublishOccupancyGauges(snap);
+  }
+
   void Run(const std::stop_token& stop_token) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
     std::deque<std::shared_ptr<ScheduledRequest>> decoding;
@@ -1023,6 +1097,7 @@ struct TextGenerationScheduler::Impl {
         }
       }
       Admit(prefilling, decoding, capturing.size(), stop_token);
+      PublishOccupancy(prefilling, decoding, capturing);
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
@@ -1146,6 +1221,8 @@ struct TextGenerationScheduler::Impl {
   bool stopping{false};
   std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
+  mutable std::mutex occupancy_mutex;
+  TextServingSnapshot occupancy;
   std::jthread worker;
 };
 
@@ -1283,6 +1360,11 @@ std::size_t TextGenerationScheduler::max_buffered_output_bytes()
     const noexcept {
   return impl_->output_budget->max_buffered_bytes.load(
       std::memory_order_relaxed);
+}
+
+TextServingSnapshot TextGenerationScheduler::Snapshot() const noexcept {
+  const std::lock_guard<std::mutex> lock(impl_->occupancy_mutex);
+  return impl_->occupancy;
 }
 
 TextGenerationScheduler::Request TextGenerationScheduler::Submit(

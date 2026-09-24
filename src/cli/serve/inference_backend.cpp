@@ -3339,6 +3339,18 @@ bool InferenceBackend::ready() const {
 #endif
 }
 
+TextServingSnapshot InferenceBackend::serving_snapshot() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->scheduler == nullptr) {
+    return {};
+  }
+  return state->scheduler->Snapshot();
+#else
+  return {};
+#endif
+}
+
 InferenceBackend::SamplingDefaults InferenceBackend::sampling_defaults() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();

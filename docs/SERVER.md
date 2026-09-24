@@ -535,19 +535,37 @@ conversations are not implemented.
 
 ## Metrics
 
-`/metrics` exposes total prompt/generated tokens and the latest prompt/decode
-speeds. `Server-Timing`, generation `timings`, and Chat Completions
-`usage.gufo` provide request-level measurements. The legacy KV-utilization
-metric and `/slots`/`/props` metadata are placeholders; do not use them for
-capacity or admission decisions.
+`/metrics` exposes total prompt/generated tokens, the latest prompt/decode
+speeds, live scheduler occupancy, and a TTFT histogram. `Server-Timing`,
+generation `timings`, and Chat Completions `usage.gufo` provide request-level
+measurements.
+
+Occupancy comes from the text scheduler worker (`TextServingSnapshot`):
+
+- `gufo_sessions_active` / `gufo_sessions_capacity` — leased sessions vs the
+  `--sessions` pool
+- `gufo_session_context_tokens_used` / `gufo_session_context_tokens_capacity` —
+  leased `CheckpointPosition` plus idle retained arena fill, over
+  `max_context * sessions`
+- `gufo_session_context_tokens_retained_idle` — idle cache entries only
+- `llamacpp:kv_cache_usage_ratio` and `gufo_session_context_usage_ratio` — the
+  same logical fill ratio. Gufo preallocates one full-context arena per
+  session; this is **not** a shared llama.cpp KV cell pool. Immutable snapshot
+  payloads that are not live on an arena are excluded.
+- `gufo_ttft_ms` — Prometheus histogram; use
+  `histogram_quantile(0.95, rate(gufo_ttft_ms_bucket[5m]))` for p95
+
+`/slots` lists one row per session capacity from the same snapshot (state,
+`n_tokens`, no prompt text). `/props` reports `n_ctx` / `n_slot` when a
+scheduler is loaded.
 
 Streaming terminal chunks always include llama.cpp-compatible `timings`, even
 without `stream_options.include_usage`. `prompt_n` counts newly processed
 tokens; `cache_n` counts reused tokens. llama-swap uses these fields on every
 turn. Gufo-specific details stay in `usage.gufo`.
 
-TODO: real slot/KV metrics, a validated administrative reload/drain interface,
-and automatic recovery after device reset or suspend/resume.
+TODO: a validated administrative reload/drain interface, and automatic recovery
+after device reset or suspend/resume.
 
 ## Troubleshooting logs
 
