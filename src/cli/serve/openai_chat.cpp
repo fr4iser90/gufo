@@ -298,9 +298,6 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   return true;
 }
 
-// Agents (Qwen Code, OpenWebUI, …) often send incomplete tool defs. Rejecting
-// the whole request breaks clients that Halogen/llama tolerate. Skip or
-// normalize bad entries; only fail when `tools` itself is the wrong type.
 bool ParseTools(const json::Value* tools,
                 std::vector<tokenization::ChatTool>* output,
                 std::string* error) {
@@ -322,8 +319,6 @@ bool ParseTools(const json::Value* tools,
       continue;
     }
 
-    // Chat Completions: {type,function:{name,parameters}}
-    // Responses-style flat: {type,name,parameters} (no nested function).
     const json::Value* function = item.find("function");
     const json::Value* name_src = nullptr;
     const json::Value* desc_src = nullptr;
@@ -357,7 +352,6 @@ bool ParseTools(const json::Value* tools,
                                "': parameters must be a JSON object schema");
       continue;
     }
-    // Missing/null parameters → empty object (no-arg tools).
     tool.parameters_json = (params_src != nullptr && params_src->is_object())
                                ? params_src->dump()
                                : "{}";
