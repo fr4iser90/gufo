@@ -599,13 +599,18 @@ void TestServingSnapshotReportsRealOccupancy() {
   TextServingSnapshot done;
   for (int spin = 0; spin < 200; ++spin) {
     done = scheduler->Snapshot();
-    if (done.active_sessions == 0 && done.queued == 0) {
+    if (done.active_sessions == 0 && done.queued == 0 &&
+        done.retained_idle_tokens > 0) {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  Expect(done.active_sessions == 0 && done.queued == 0 && done.used_tokens == 0,
-         "snapshot returns to empty after requests complete");
+  Expect(done.active_sessions == 0 && done.queued == 0,
+         "snapshot returns to no leased work after requests complete");
+  Expect(done.retained_idle_tokens > 0 &&
+             done.used_tokens == done.retained_idle_tokens &&
+             done.used_tokens <= done.capacity_tokens,
+         "idle retained prefixes remain in the KV fill after completion");
 }
 
 void TestRunnerCanSkipUnusedFinalAdvance() {

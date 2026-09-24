@@ -795,6 +795,13 @@ std::size_t TextRunnerPool::Request::checkpoint_position() const {
   return impl_->runner->CheckpointPosition(state);
 }
 
+std::size_t TextRunnerPool::Request::lease_index() const {
+  if (impl_ == nullptr) {
+    throw std::logic_error("text runner request is empty");
+  }
+  return impl_->lease.index();
+}
+
 void TextRunnerPool::Request::PrepareBatchExecution() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
@@ -1093,6 +1100,11 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->cache.capacity();
+}
+
+std::vector<ContinuationCache::OccupancyEntry> TextRunnerPool::cache_occupancy()
+    const {
+  return impl_->cache.Occupancy();
 }
 
 TextExecutionPlan TextRunnerPool::SelectDecodePlan(

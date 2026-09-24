@@ -432,6 +432,24 @@ std::size_t ContinuationCache::reserved_snapshot_bytes() const noexcept {
   return impl_->reserved_snapshot_bytes;
 }
 
+std::vector<ContinuationCache::OccupancyEntry> ContinuationCache::Occupancy()
+    const {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::vector<OccupancyEntry> out;
+  out.reserve(impl_->entries.size());
+  const bool snapshot_mode = impl_->snapshot_mode();
+  for (const auto& entry : impl_->entries) {
+    OccupancyEntry row;
+    row.available = entry->available;
+    if (entry->available) {
+      row.retained_tokens = snapshot_mode ? entry->live_tokens.size()
+                                          : entry->tokens.size();
+    }
+    out.push_back(row);
+  }
+  return out;
+}
+
 ContinuationState& ContinuationCache::StateAt(std::size_t index) {
   return *impl_->entries.at(index)->state;
 }

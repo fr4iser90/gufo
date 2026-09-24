@@ -541,11 +541,13 @@ Occupancy comes from the text scheduler worker (`TextServingSnapshot`):
 - `gufo_sessions_active` / `gufo_sessions_capacity` — leased sessions vs the
   `--sessions` pool
 - `gufo_session_context_tokens_used` / `gufo_session_context_tokens_capacity` —
-  sum of leased `CheckpointPosition` over `max_context * sessions`
+  leased `CheckpointPosition` plus idle retained arena fill, over
+  `max_context * sessions`
+- `gufo_session_context_tokens_retained_idle` — idle cache entries only
 - `llamacpp:kv_cache_usage_ratio` and `gufo_session_context_usage_ratio` — the
   same logical fill ratio. Gufo preallocates one full-context arena per
-  session; this is **not** a shared llama.cpp KV cell pool. Idle retained
-  prefixes are omitted until the continuation cache exposes them.
+  session; this is **not** a shared llama.cpp KV cell pool. Immutable snapshot
+  payloads that are not live on an arena are excluded.
 - `gufo_ttft_ms` — Prometheus histogram; use
   `histogram_quantile(0.95, rate(gufo_ttft_ms_bucket[5m]))` for p95
 
@@ -558,9 +560,8 @@ without `stream_options.include_usage`. `prompt_n` counts newly processed
 tokens; `cache_n` counts reused tokens. llama-swap uses these fields on every
 turn. Gufo-specific details stay in `usage.gufo`.
 
-TODO: idle retained-prefix fill in the KV ratio, a validated administrative
-reload/drain interface, and automatic recovery after device reset or
-suspend/resume.
+TODO: a validated administrative reload/drain interface, and automatic recovery
+after device reset or suspend/resume.
 
 ## Troubleshooting logs
 

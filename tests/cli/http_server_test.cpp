@@ -363,6 +363,8 @@ void TestFramingAndMetrics() {
   assert(metrics.find("gufo_sessions_capacity 2\n") != std::string::npos);
   assert(metrics.find("gufo_session_context_tokens_used 1024\n") !=
          std::string::npos);
+  assert(metrics.find("gufo_session_context_tokens_retained_idle ") !=
+         std::string::npos);
   assert(metrics.find("gufo_ttft_ms_bucket{le=\"+Inf\"}") != std::string::npos);
   assert(metrics.find("gufo_ttft_ms_count ") != std::string::npos);
 

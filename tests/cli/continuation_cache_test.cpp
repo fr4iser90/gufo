@@ -75,6 +75,31 @@ void TestColdMissThenExactExtensionHit() {
   }
 }
 
+void TestOccupancyReportsIdleRetainedTokens() {
+  std::vector<std::size_t> invalidations(1);
+  gufo::server::ContinuationCache cache(
+      1, [&] { return std::make_unique<FakeState>(0, &invalidations); });
+
+  {
+    const auto occ = cache.Occupancy();
+    Expect(occ.size() == 1 && occ[0].available && occ[0].retained_tokens == 0,
+           "cold occupancy has an empty available slot");
+  }
+  {
+    auto lease = cache.Acquire(
+        std::vector<gufo::server::ContinuationToken>{1, 2, 3});
+    Expect(!cache.Occupancy()[0].available &&
+               cache.Occupancy()[0].retained_tokens == 0,
+           "leased slots report no idle retained fill");
+    lease.Commit({1, 2, 3, 4});
+  }
+  {
+    const auto occ = cache.Occupancy();
+    Expect(occ.size() == 1 && occ[0].available && occ[0].retained_tokens == 4,
+           "committed mutable prefix is retained on the idle entry");
+  }
+}
+
 void TestDivergenceInvalidatesOldState() {
   std::vector<std::size_t> invalidations(1);
   gufo::server::ContinuationCache cache(
@@ -522,6 +547,7 @@ void TestImageIdentityIsolation() {
 int main() {
   TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();
+  TestOccupancyReportsIdleRetainedTokens();
   TestDivergenceInvalidatesOldState();
   TestUncommittedLeaseIsInvalidated();
   TestLongestAvailablePrefixWins();

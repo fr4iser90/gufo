@@ -101,7 +101,7 @@ struct ChatRequest {
   bool cache_prompt{true};
 };
 
-/// Live scheduler occupancy (leased sessions and their CheckpointPositions).
+/// Live scheduler occupancy (leased sessions and idle retained arena fill).
 struct TextServingSnapshot {
   enum class SlotState : std::uint8_t {
     kIdle = 0,
@@ -127,6 +127,7 @@ struct TextServingSnapshot {
   std::size_t used_tokens{0};
   std::size_t capacity_tokens{0};
   std::size_t max_used_tokens{0};
+  std::size_t retained_idle_tokens{0};
   std::vector<Slot> slots;
 };
 

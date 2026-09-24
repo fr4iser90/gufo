@@ -110,6 +110,7 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept {
       return cache_ != nullptr;
     }
+    [[nodiscard]] std::size_t index() const noexcept { return index_; }
     [[nodiscard]] ContinuationState& state() const;
     [[nodiscard]] bool cache_hit() const noexcept { return cache_hit_; }
     [[nodiscard]] std::size_t cached_tokens() const noexcept {
@@ -200,6 +201,13 @@ public:
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
   [[nodiscard]] std::size_t retained_snapshot_bytes() const noexcept;
   [[nodiscard]] std::size_t reserved_snapshot_bytes() const noexcept;
+
+  /// Per-entry arena fill for idle retained prefixes (leased entries report 0).
+  struct OccupancyEntry {
+    bool available{true};
+    std::size_t retained_tokens{0};
+  };
+  [[nodiscard]] std::vector<OccupancyEntry> Occupancy() const;
 
 private:
   struct Entry;

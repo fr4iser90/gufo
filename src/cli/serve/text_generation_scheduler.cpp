@@ -1026,32 +1026,48 @@ struct TextGenerationScheduler::Impl {
       snap.queued = queued_count;
     }
 
-    snap.slots.reserve(snap.session_capacity);
-    const auto append_active =
+    const auto cache_occ = runner_pool->cache_occupancy();
+    snap.slots.assign(snap.session_capacity, {});
+    for (std::size_t index = 0; index < snap.session_capacity; ++index) {
+      TextServingSnapshot::Slot slot;
+      slot.id = index;
+      slot.state = TextServingSnapshot::SlotState::kIdle;
+      if (index < cache_occ.size() && cache_occ[index].available) {
+        slot.tokens = cache_occ[index].retained_tokens;
+      }
+      snap.slots[index] = slot;
+    }
+
+    const auto overlay_active =
         [&](const std::deque<std::shared_ptr<ScheduledRequest>>& requests,
             TextServingSnapshot::SlotState state) noexcept {
           for (const auto& request : requests) {
+            std::size_t index = 0;
             std::size_t tokens = 0;
             try {
+              index = request->runner_request.lease_index();
               tokens = request->runner_request.checkpoint_position();
             } catch (...) {
-              tokens = 0;
+              continue;
             }
-            snap.used_tokens += tokens;
-            snap.max_used_tokens = std::max(snap.max_used_tokens, tokens);
-            if (snap.slots.size() < snap.session_capacity) {
-              snap.slots.push_back(
-                  {.id = request->id, .state = state, .tokens = tokens});
+            if (index >= snap.slots.size()) {
+              continue;
             }
+            snap.slots[index] = {.id = request->id,
+                                 .state = state,
+                                 .tokens = tokens};
           }
         };
-    append_active(prefilling, TextServingSnapshot::SlotState::kPrefilling);
-    append_active(decoding, TextServingSnapshot::SlotState::kDecoding);
-    append_active(capturing, TextServingSnapshot::SlotState::kCapturing);
-    while (snap.slots.size() < snap.session_capacity) {
-      snap.slots.push_back({.id = snap.slots.size(),
-                            .state = TextServingSnapshot::SlotState::kIdle,
-                            .tokens = 0});
+    overlay_active(prefilling, TextServingSnapshot::SlotState::kPrefilling);
+    overlay_active(decoding, TextServingSnapshot::SlotState::kDecoding);
+    overlay_active(capturing, TextServingSnapshot::SlotState::kCapturing);
+
+    for (const auto& slot : snap.slots) {
+      snap.used_tokens += slot.tokens;
+      snap.max_used_tokens = std::max(snap.max_used_tokens, slot.tokens);
+      if (slot.state == TextServingSnapshot::SlotState::kIdle) {
+        snap.retained_idle_tokens += slot.tokens;
+      }
     }
 
     {
