@@ -715,12 +715,19 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+  // Shared-pool sessions grow MTP KV with need (CreateSession starts at
+  // 16k). Claim the initial footprint here; FitSharedKvPool still budgets
+  // the eventual full-context private MTP on the host side.
+  const std::uint32_t mtp_ctx =
+      attention_pool_ != nullptr
+          ? std::min(max_context, std::uint32_t{16384})
+          : max_context;
   const std::size_t kv =
-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
+      2 * std::size_t{mtp_ctx} * c.AttentionKvDim() * sizeof(__half);
   const std::size_t index =
-      std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
+      std::size_t{IndexerCapacity(c, options_.max_batch, mtp_ctx)} *
           c.indexer_head_dim * sizeof(float) +
-      std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
+      std::size_t{mtp_ctx / c.compress_ratio + 1} * c.indexer_head_dim *
           sizeof(__half);
   // Shared pools own trunk KV + block_k; sessions still keep the indexer ring
   // and speculative MTP caches privately.

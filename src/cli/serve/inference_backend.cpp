@@ -2369,14 +2369,21 @@ public:
       const auto deferred = model_->DeferredScratchBytes();
       capacity = free_bytes > deferred ? free_bytes - deferred : 0;
     }
+    const std::size_t per_request = model_->SessionBytes(
+        use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                 : gufo::core::SessionMode::kAutoregressive,
+        max_context_);
+    // Shared KV pool + host FitSharedKvPool already gated load. After the pool
+    // is resident, hipMemGetInfo on unified APUs can under-report free relative
+    // to that host budget; do not refuse the runner when the pool is active.
+    if (model_->AttentionPoolBytes() > 0) {
+      capacity = std::nullopt;
+    }
     // Snapshots live in host memory, not in the device state pool.
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = model_->SessionBytes(
-            use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                     : gufo::core::SessionMode::kAutoregressive,
-            max_context_),
+        .per_request_state_bytes = per_request,
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
