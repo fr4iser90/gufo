@@ -465,102 +465,114 @@ void TestToolCallsAreStructured() {
          "Required tool choice reaches the model backend");
 }
 
-void TestLenientToolsTolerateAgentClients() {
-  FakeBackend backend;
-  // Mix: missing parameters, flat Responses shape, nameless junk, bad type.
-  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
-    "model":"test-model",
-    "messages":[{"role":"user","content":"hi"}],
-    "tools":[
-      {"type":"function","function":{"name":"no_params"}},
-      {"type":"function","name":"flat_tool","parameters":{"type":"object"}},
-      {"type":"function","function":{"name":"","parameters":{}}},
-      {"type":"custom","custom":{"name":"x"}},
-      {"type":"function","function":{"name":"ok","parameters":{"type":"object",
-        "properties":{"q":{"type":"string"}}}}}
-    ]
-  })"),
-                                                       backend);
-  Expect(response.status == 200, "incomplete agent tool lists must not 400");
-  Expect(backend.last_request.tools.size() == 3,
-         "valid + normalized tools kept; nameless/unsupported skipped");
-  Expect(backend.last_request.tools[0].name == "no_params" &&
-             backend.last_request.tools[0].parameters_json == "{}",
-         "missing parameters become empty object schema");
-  Expect(backend.last_request.tools[1].name == "flat_tool",
-         "Responses-style flat function tools are accepted");
-  Expect(backend.last_request.tools[2].name == "ok",
-         "complete tools still reach the backend");
-
-  const auto kept_tools = backend.last_request.tools;
-  const auto kept_messages = backend.last_request.messages;
-
-  // Named tool with non-object parameters is not repairable → 400.
-  const auto bad_params = gufo::server::HandleOpenAiChat(Request(R"({
-    "model":"test-model",
-    "messages":[{"role":"user","content":"hi"}],
-    "tools":[{"type":"function","function":{"name":"bad","parameters":"nope"}}]
-  })"),
-                                                         backend);
-  Expect(bad_params.status == 400 &&
-             bad_params.body.find("invalid_tools") != std::string::npos,
-         "named tools with non-object parameters are rejected");
-
-  // parametersJsonSchema alias (some agent clients).
-  FakeBackend alias_backend;
-  const auto alias = gufo::server::HandleOpenAiChat(Request(R"({
-    "model":"test-model",
-    "messages":[{"role":"user","content":"hi"}],
-    "tools":[{"type":"function","function":{"name":"alias",
-      "parametersJsonSchema":{"type":"object","properties":{"x":{"type":"string"}}}}}]
-  })"),
-                                                    alias_backend);
-  Expect(alias.status == 200 && alias_backend.last_request.tools.size() == 1 &&
-             alias_backend.last_request.tools[0].name == "alias" &&
-             alias_backend.last_request.tools[0].parameters_json.find(
-                 "\"x\"") != std::string::npos,
-         "parametersJsonSchema is accepted as a parameters alias");
-
-  for (const auto& tool : kept_tools) {
-    const auto definition = gufo::json::parse(tool.definition_json);
-    const auto* function = definition.find("function");
-    Expect(definition.member_str("type") == "function" && function != nullptr &&
-               function->is_object() &&
-               function->member_str("name") == tool.name &&
-               function->find("parameters") != nullptr &&
-               function->find("parameters")->is_object(),
-           "definition_json is nested Chat Completions shape for templates");
+void TestToolParameterCompatibility() {
+  using gufo::json::Value;
+  const std::pair<const char*, const char*> cases[] = {
+      {R"({"name":"f"})", "{}"},
+      {R"({"name":"f","parameters":null})", "{}"},
+      {R"({"name":"f","parameters":{}})", "{}"},
+      {R"({"name":"f","parametersJsonSchema":null})", "{}"},
+      {R"({"name":"f","parametersJsonSchema":{"type":"object"}})",
+       R"({"type":"object"})"},
+      {R"({"name":"f","parameters":null,"parametersJsonSchema":{"type":"object"}})",
+       R"({"type":"object"})"},
+      {R"({"name":"f","parameters":{},"parametersJsonSchema":"ignored"})",
+       "{}"},
+  };
+  for (bool flat : {false, true}) {
+    for (bool stream : {false, true}) {
+      for (const auto& [function_json, expected_parameters] : cases) {
+        FakeBackend backend;
+        backend.pieces = {
+            "<tool_call>\n<function=f>\n</function>\n</tool_call>"};
+        auto body = gufo::json::parse(R"({
+          "model":"test-model","messages":[{"role":"user","content":"call f"}],
+          "tool_choice":"required","tools":[]
+        })");
+        auto definition = Value::object();
+        definition["type"] = "function";
+        auto function = gufo::json::parse(function_json);
+        if (flat) {
+          for (const auto& [key, value] : function.members())
+            definition.append_member(key, value);
+        } else {
+          definition["function"] = function;
+        }
+        body["tools"].push_back(std::move(definition));
+        body["stream"] = stream;
+        const auto response =
+            gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        Expect(response.status == 200, "Compatible tool schema is accepted");
+        std::string output = response.body;
+        if (stream) {
+          Expect(static_cast<bool>(response.streaming_body),
+                 "Compatible tool request supports streaming");
+          response.streaming_body([&](std::string_view chunk) {
+            output += chunk;
+            return true;
+          });
+        }
+        Expect(output.find(R"("name":"f")") != std::string::npos &&
+                   output.find(R"("finish_reason":"tool_calls")") !=
+                       std::string::npos,
+               "No-argument function returns a structured tool call");
+        Expect(backend.last_request.tools.size() == 1,
+               "Normalized tool reaches the backend");
+        const auto& tool = backend.last_request.tools.front();
+        Expect(tool.parameters_json == expected_parameters,
+               "Missing/null schemas normalize and parameters take precedence");
+        auto expected_function = Value::object();
+        expected_function["name"] = "f";
+        expected_function["parameters"] =
+            gufo::json::parse(expected_parameters);
+        auto expected_definition = Value::object();
+        expected_definition["type"] = "function";
+        expected_definition["function"] = expected_function;
+        Expect(tool.definition_json == expected_definition.dump(),
+               "Templates receive the normalized nested definition");
+      }
+    }
   }
+}
 
-  gufo::tokenization::ChatTemplateOptions options;
-  options.enable_thinking = false;
-  const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
-      kept_messages, kept_tools, options);
-  Expect(rendered.has_value(), "Qwen template renders lenient tools");
-  Expect(
-      rendered->find(
-          R"({"type": "function", "function": {"name": "no_params", "parameters": {}}})") !=
-          std::string::npos,
-      "Qwen prompt gets parameters={} for missing schemas");
-  Expect(
-      rendered->find(
-          R"({"type": "function", "function": {"name": "flat_tool", "parameters": {"type": "object"}}})") !=
-          std::string::npos,
-      "Qwen prompt nests flat Responses-style tools under function");
-  Expect(rendered->find(R"({"type": "function", "name": "flat_tool")") ==
-             std::string::npos,
-         "Qwen prompt must not emit flat top-level tool shapes");
-
-  // DS4 extracts definition_json["function"]; a flat dump makes operator[]
-  // insert null and poison the tool list.
-  for (const auto& tool : kept_tools) {
-    const auto root = gufo::json::parse(tool.definition_json);
-    const auto* function = root.find("function");
-    Expect(function != nullptr && function->is_object() &&
-               !function->member_str("name").empty() &&
-               function->find("parameters") != nullptr &&
-               function->find("parameters")->is_object(),
-           "DS4 function extraction stays an object, never null");
+void TestInvalidToolsFailBeforeGeneration() {
+  const char* invalid[] = {
+      "null",
+      "42",
+      R"({"function":{"name":"f"}})",
+      R"({"type":42,"function":{"name":"f"}})",
+      R"({"type":"custom","custom":{"name":"shell"}})",
+      R"({"type":"function","function":null,"name":"f"})",
+      R"({"type":"function","function":[],"name":"f"})",
+      R"({"type":"function","function":{}})",
+      R"({"type":"function","name":""})",
+      R"({"type":"function","name":42})",
+      R"({"type":"function","name":"f","parameters":"bad"})",
+      R"({"type":"function","name":"f","parameters":[]})",
+      R"({"type":"function","name":"f","parameters":false})",
+      R"({"type":"function","name":"f","parametersJsonSchema":[]})",
+  };
+  for (bool stream : {false, true}) {
+    for (bool valid_first : {false, true}) {
+      for (const char* entry : invalid) {
+        FakeBackend backend;
+        auto body = gufo::json::parse(R"({
+          "model":"test-model","messages":[{"role":"user","content":"use tools"}],
+          "tools":[]
+        })");
+        if (valid_first)
+          body["tools"].push_back(gufo::json::parse(
+              R"({"type":"function","function":{"name":"valid","parameters":{}}})"));
+        body["tools"].push_back(gufo::json::parse(entry));
+        body["stream"] = stream;
+        const auto response =
+            gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        Expect(response.status == 400 &&
+                   response.body.find("invalid_tools") != std::string::npos &&
+                   !response.streaming_body && backend.chat_calls == 0,
+               "Invalid tools fail before generation, including mixed lists");
+      }
+    }
   }
 }
 
@@ -797,40 +809,73 @@ void TestCompleteToolDefinitionsReachTemplate() {
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
     "model":"test-model",
     "messages":[{"role":"user","content":"Emit a value."}],
-    "tools":[{"type":"function","function":{"name":"emit","strict":true,
-      "parameters":{"type":"object","additionalProperties":false}},
+    "tools":[{"type":"function","function":{"parameters":{
+      "type":"object","additionalProperties":false},"strict":true,
+      "description":"","name":"emit"},
       "vendor":{"version":2}}]
   })"),
                                                        backend);
   Expect(response.status == 200 && backend.last_request.tools.size() == 1,
          "complete function definition reaches the backend");
   const auto& tool = backend.last_request.tools.front();
-  const auto definition = gufo::json::parse(tool.definition_json);
-  const auto* function = definition.find("function");
-  const auto* strict = function != nullptr ? function->find("strict") : nullptr;
-  const auto* parameters =
-      function != nullptr ? function->find("parameters") : nullptr;
-  const auto* vendor = definition.find("vendor");
-  Expect(definition.member_str("type") == "function" && function != nullptr &&
-             function->is_object() && function->member_str("name") == "emit" &&
-             strict != nullptr && strict->is_bool() && strict->as_bool() &&
-             parameters != nullptr && parameters->is_object() &&
-             parameters->find("additionalProperties") != nullptr &&
-             vendor != nullptr && vendor->is_object() &&
-             vendor->member_size("version") == 2,
-         "canonical definition keeps name, parameters, strict and vendor");
+  Expect(
+      tool.definition_json ==
+          R"({"type":"function","function":{"parameters":{"type":"object","additionalProperties":false},"strict":true,"description":"","name":"emit"},"vendor":{"version":2}})",
+      "Valid nested definitions retain every field and its original order");
   gufo::tokenization::ChatTemplateOptions options;
   options.enable_thinking = false;
   const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
       backend.last_request.messages, backend.last_request.tools, options);
   Expect(
       rendered.has_value() &&
-          rendered->find("\"name\": \"emit\"") != std::string::npos &&
-          rendered->find("\"strict\": true") != std::string::npos &&
-          rendered->find("\"additionalProperties\": false") !=
-              std::string::npos &&
-          rendered->find("\"vendor\": {\"version\": 2}") != std::string::npos,
-      "template renders nested function plus preserved extras");
+          rendered->find(
+              R"({"type": "function", "function": {"parameters": {"type": "object", "additionalProperties": false}, "strict": true, "description": "", "name": "emit"}, "vendor": {"version": 2}})") !=
+              std::string::npos,
+      "Existing valid tool JSON is unchanged in the Qwen prompt");
+}
+
+void TestFlatToolFieldsReachTemplate() {
+  for (const char* strict : {"true", "false", "null"}) {
+    FakeBackend backend;
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"use f"}],
+      "tools":[]
+    })");
+    auto function = gufo::json::parse(R"({
+      "name":"f","description":"","parameters":{"type":"object"},
+      "strict":null,"vendor":{"version":2}
+    })");
+    function["strict"] = gufo::json::parse(strict);
+    auto flat = function;
+    flat["type"] = "function";
+    body["tools"].push_back(flat);
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200 && backend.last_request.tools.size() == 1,
+           "Flat function with additional fields is accepted");
+    const auto flat_tools = backend.last_request.tools;
+    const auto definition = gufo::json::parse(flat_tools[0].definition_json);
+    const auto* nested = definition.find("function");
+    Expect(nested && nested->dump() == function.dump() &&
+               !definition.contains("strict") && !definition.contains("vendor"),
+           "All flat function fields survive DS4's nested function extraction");
+    gufo::tokenization::ChatTemplateOptions options;
+    options.enable_thinking = false;
+    const auto flat_prompt = gufo::tokenization::QwenChatTemplate::Render(
+        backend.last_request.messages, flat_tools, options);
+    auto canonical = gufo::json::Value::object();
+    canonical["type"] = "function";
+    canonical["function"] = function;
+    body["tools"] = gufo::json::Value::array();
+    body["tools"].push_back(canonical);
+    const auto nested_response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(nested_response.status == 200, "Nested equivalent is accepted");
+    const auto nested_prompt = gufo::tokenization::QwenChatTemplate::Render(
+        backend.last_request.messages, backend.last_request.tools, options);
+    Expect(flat_prompt.has_value() && nested_prompt == flat_prompt,
+           "Flat and nested tools produce identical Qwen prompts");
+  }
 }
 
 void TestAllSamplingControlsReachBackend() {
@@ -1180,6 +1225,7 @@ int main() {
   TestCachedPrefillMetrics();
   TestBackendSamplingDefaults();
   TestCompleteToolDefinitionsReachTemplate();
+  TestFlatToolFieldsReachTemplate();
   TestAllSamplingControlsReachBackend();
   TestUnsupportedSamplingControlsAreRejected();
   TestAssistantReasoningContentReachesBackend();
@@ -1188,7 +1234,8 @@ int main() {
   TestStreamingPromptOpenedReasoning();
   TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
-  TestLenientToolsTolerateAgentClients();
+  TestToolParameterCompatibility();
+  TestInvalidToolsFailBeforeGeneration();
   TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();

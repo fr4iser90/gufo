@@ -21,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
@@ -308,24 +307,22 @@ bool ParseTools(const json::Value* tools,
     *error = "'tools' must be an array";
     return false;
   }
-  // Repairable: missing/null parameters → {}, flat Responses-style entries,
-  // and parametersJsonSchema as an alias for parameters. Unrepairable named
-  // tools (non-object parameters) are 400. Junk entries are skipped once.
-  std::size_t skipped = 0;
   for (const auto& item : tools->items()) {
     if (!item.is_object()) {
-      ++skipped;
-      continue;
+      *error = "'tools' entries must be objects";
+      return false;
     }
-    const std::string type = item.member_str("type", "function");
-    if (type != "function") {
-      ++skipped;
-      continue;
+    if (item.member_str("type") != "function") {
+      *error = "only function tools are supported";
+      return false;
     }
 
     const json::Value* function = item.find("function");
-    const json::Value* src =
-        (function != nullptr && function->is_object()) ? function : &item;
+    if (function != nullptr && !function->is_object()) {
+      *error = "'function' must be an object";
+      return false;
+    }
+    const json::Value* src = function != nullptr ? function : &item;
     // OpenAI uses "parameters"; some agent clients send parametersJsonSchema.
     const json::Value* params_src = src->find("parameters");
     if (params_src == nullptr || params_src->is_null()) {
@@ -336,52 +333,34 @@ bool ParseTools(const json::Value* tools,
     tool.name = src->member_str("name");
     tool.description = src->member_str("description");
     if (tool.name.empty()) {
-      ++skipped;
-      continue;
+      *error = "function tools require a nonempty name";
+      return false;
     }
     if (params_src != nullptr && !params_src->is_null() &&
         !params_src->is_object()) {
       *error = "function tools require an object parameters schema";
       return false;
     }
-    tool.parameters_json = (params_src != nullptr && params_src->is_object())
-                               ? params_src->dump()
-                               : "{}";
-
-    // Templates prefer definition_json over name/parameters_json. Always emit
-    // the nested Chat Completions shape so Qwen and DS4 see normalized fields.
+    // Preserve nested definitions and their field order. For flat tools, move
+    // the complete function body (including strict) under "function".
     json::Value function_obj = json::Value::object();
-    function_obj.append_member("name", tool.name);
-    if (!tool.description.empty()) {
-      function_obj.append_member("description", tool.description);
-    }
-    function_obj.append_member("parameters", json::parse(tool.parameters_json));
-    if (function != nullptr && function->is_object()) {
-      for (const auto& [key, value] : function->members()) {
-        if (key == "name" || key == "description" || key == "parameters" ||
-            key == "parametersJsonSchema") {
-          continue;
-        }
-        function_obj.append_member(key, value);
-      }
-    }
-    json::Value definition = json::Value::object();
-    definition.append_member("type", "function");
-    definition.append_member("function", std::move(function_obj));
-    for (const auto& [key, value] : item.members()) {
-      if (key == "type" || key == "function" || key == "name" ||
-          key == "description" || key == "parameters" ||
-          key == "parametersJsonSchema") {
+    for (const auto& [key, value] : src->members()) {
+      if (key == "parametersJsonSchema" ||
+          (function == nullptr && key == "type")) {
         continue;
       }
-      definition.append_member(key, value);
+      function_obj.append_member(key, value);
     }
+    function_obj["parameters"] =
+        params_src != nullptr && params_src->is_object()
+            ? *params_src
+            : json::Value::object();
+    tool.parameters_json = function_obj.find("parameters")->dump();
+    json::Value definition = function != nullptr ? item : json::Value::object();
+    definition["type"] = "function";
+    definition["function"] = std::move(function_obj);
     tool.definition_json = definition.dump();
     output->push_back(std::move(tool));
-  }
-  if (skipped != 0) {
-    Logger::Warn("http", "skipped " + std::to_string(skipped) +
-                             " invalid tools[] entries");
   }
   return true;
 }
