@@ -93,9 +93,15 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   m->weights_ = std::make_unique<ModelWeights>(std::move(*weights));
   const Config& c = m->weights_->config;
-  if (options.max_context == 0 || options.max_context > c.context_length) {
-    AssignError(error_msg, "context exceeds the model's " +
-                               std::to_string(c.context_length) + " tokens");
+  if (!YarnFactorSupported(options.rope_yarn_factor)) {
+    AssignError(error_msg, "rope YaRN factor must be 0, 1, or 4");
+    return nullptr;
+  }
+  const auto context_limit =
+      EffectiveContextLimit(c.context_length, options.rope_yarn_factor);
+  if (options.max_context == 0 || options.max_context > context_limit) {
+    AssignError(error_msg, "context exceeds the allowed " +
+                               std::to_string(context_limit) + " tokens");
     return nullptr;
   }
   if (options.kv_pool_positions != 0 &&
@@ -152,6 +158,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.kv_pool_positions = options.kv_pool_positions;
+  exec.rope_yarn_factor = options.rope_yarn_factor;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {

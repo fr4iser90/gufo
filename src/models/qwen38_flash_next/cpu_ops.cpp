@@ -148,16 +148,17 @@ float Softplus(float x) noexcept {
 }
 
 void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
-          std::uint32_t rotary_dim, std::uint32_t pos, float theta) {
+          std::uint32_t rotary_dim, std::uint32_t pos, float theta,
+          float freq_scale, float attn_factor) {
   const std::uint32_t half = rotary_dim / 2;
   for (std::uint32_t h = 0; h < heads; ++h) {
     float* v = x + static_cast<std::size_t>(h) * head_dim;
     for (std::uint32_t i = 0; i < half; ++i) {
       const float freq = std::pow(theta, -2.0F * static_cast<float>(i) /
                                              static_cast<float>(rotary_dim));
-      const float angle = static_cast<float>(pos) * freq;
-      const float c = std::cos(angle);
-      const float s = std::sin(angle);
+      const float angle = static_cast<float>(pos) * freq * freq_scale;
+      const float c = std::cos(angle) * attn_factor;
+      const float s = std::sin(angle) * attn_factor;
       const float a = v[i];
       const float b = v[i + half];
       v[i] = a * c - b * s;

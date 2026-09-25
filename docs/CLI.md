@@ -174,9 +174,15 @@ These apply to every modality, before or after the subcommand:
   unless Flash-Next `--kv-pool-positions` shares attention KV. This option
   applies to LLM serving; image and speech servers use their own bounded
   queues.
-- `kv-pool-positions` — Flash-Next shared attention KV positions (Halogen-style).
-  `0` (default) keeps private arenas. When set, must be ≥ `--context`; slots
-  reserve spans lazily so several conversations can share one pool.
+- `kv-pool-positions` — Flash-Next shared attention KV positions. `0`
+  (default) keeps private arenas. When set, must be ≥ `--context`; at load the
+  pool may shrink to fit host RAM (`event=kv_pool_fit`). Spans are reserved by
+  need, not the full `--context`, so several conversations can share one pool.
+- `rope-yarn` — Flash-Next static YaRN factor (`0`/`1` off, `4` raises the
+  context ceiling to native×4, ~1M). Pair with matching `--context` /
+  `--kv-pool-positions`.
+- `host-reserve-gib` — GiB kept free when fitting the shared KV pool (default
+  16). Lower only if you know the host can spare less.
 - `maxConnections` — maximum simultaneous HTTP connections. In practice:
   clients beyond the limit queue or are refused instead of piling up.
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly

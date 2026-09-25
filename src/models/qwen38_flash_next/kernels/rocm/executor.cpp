@@ -18,6 +18,7 @@
 #include "qfn_mmq.h"
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/yarn.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -562,7 +563,9 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     return nullptr;
   }
   const Config& c = config();
-  if (max_context == 0 || max_context > c.context_length) {
+  const auto context_limit =
+      EffectiveContextLimit(c.context_length, options_.rope_yarn_factor);
+  if (max_context == 0 || max_context > context_limit) {
     AssignError(error_msg, "session context exceeds the model context");
     return nullptr;
   }
@@ -619,20 +622,26 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
   if (s->mtp_enabled_) {
+    // With a shared trunk pool, grow draft KV with need instead of claiming
+    // the full --context up front (that alone OOMs near 1M).
+    const std::uint32_t mtp_cap =
+        s->kv_pooled_ ? std::min(max_context, std::uint32_t{16384})
+                      : max_context;
+    s->mtp_kv_capacity_ = mtp_cap;
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
     s->mtp_.k_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        Alloc<__half>(a, static_cast<std::size_t>(mtp_cap) * kv_row, error_msg,
+                      &s->allocated_bytes_);
     s->mtp_.v_cache =
-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
-                      error_msg, &s->allocated_bytes_);
+        Alloc<__half>(a, static_cast<std::size_t>(mtp_cap) * kv_row, error_msg,
+                      &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
     s->mtp_.block_k = Alloc<__half>(
-        a, std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim,
+        a, std::size_t{mtp_cap / c.compress_ratio + 1} * c.indexer_head_dim,
         error_msg, &s->allocated_bytes_);
     s->mtp_.h = Alloc<float>(a, c.HcDim(), error_msg, &s->allocated_bytes_);
   }
@@ -788,8 +797,108 @@ void Executor::ReleaseSessionKv(Session& session) const {
   }
 }
 
+bool Executor::EnsureMtpKvCapacity(Session& session, std::uint32_t need,
+                                   std::string* error_msg) const {
+  if (!session.mtp_enabled_ || !session.kv_pooled_) {
+    return true;
+  }
+  if (need == 0 || session.mtp_kv_capacity_ >= need) {
+    return true;
+  }
+  if (need > session.max_context_) {
+    AssignError(error_msg, "session context is full");
+    return false;
+  }
+  const Config& c = config();
+  const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
+  auto align = [ratio](std::uint32_t n) {
+    return ((n + ratio - 1) / ratio) * ratio;
+  };
+  std::uint32_t want = align(need);
+  if (want < need) {
+    want = need;
+  }
+  want = std::min(want, session.max_context_);
+  const std::size_t kv_row = c.AttentionKvDim();
+  const std::size_t old_cap = session.mtp_kv_capacity_;
+  const std::size_t live =
+      std::min<std::size_t>(session.position_, session.mtp_kv_capacity_);
+
+  __half* new_k = nullptr;
+  __half* new_v = nullptr;
+  __half* new_block = nullptr;
+  const std::size_t kv_bytes =
+      static_cast<std::size_t>(want) * kv_row * sizeof(__half);
+  const std::size_t block_bytes =
+      (static_cast<std::size_t>(want) / c.compress_ratio + 1) *
+      c.indexer_head_dim * sizeof(__half);
+  if (!Check(hipMalloc(&new_k, kv_bytes), "mtp k grow", error_msg) ||
+      !Check(hipMalloc(&new_v, kv_bytes), "mtp v grow", error_msg) ||
+      !Check(hipMalloc(&new_block, block_bytes), "mtp block_k grow",
+             error_msg)) {
+    (void)hipFree(new_k);
+    (void)hipFree(new_v);
+    (void)hipFree(new_block);
+    return false;
+  }
+  (void)hipMemset(new_k, 0, kv_bytes);
+  (void)hipMemset(new_v, 0, kv_bytes);
+  (void)hipMemset(new_block, 0, block_bytes);
+  if (live > 0) {
+    const std::size_t copy_kv = live * kv_row * sizeof(__half);
+    const std::size_t copy_blocks = (live + c.compress_ratio - 1) /
+                                    c.compress_ratio * c.indexer_head_dim *
+                                    sizeof(__half);
+    if (!Check(hipMemcpy(new_k, session.mtp_.k_cache, copy_kv,
+                         hipMemcpyDeviceToDevice),
+               "mtp k relocate", error_msg) ||
+        !Check(hipMemcpy(new_v, session.mtp_.v_cache, copy_kv,
+                         hipMemcpyDeviceToDevice),
+               "mtp v relocate", error_msg) ||
+        !Check(hipMemcpy(new_block, session.mtp_.block_k, copy_blocks,
+                         hipMemcpyDeviceToDevice),
+               "mtp block_k relocate", error_msg)) {
+      (void)hipFree(new_k);
+      (void)hipFree(new_v);
+      (void)hipFree(new_block);
+      return false;
+    }
+  }
+  auto retire = [&](void* p) {
+    if (p == nullptr) {
+      return;
+    }
+    (void)hipFree(p);
+    for (void*& slot : session.allocations_) {
+      if (slot == p) {
+        slot = nullptr;
+        break;
+      }
+    }
+  };
+  retire(session.mtp_.k_cache);
+  retire(session.mtp_.v_cache);
+  retire(session.mtp_.block_k);
+  session.mtp_.k_cache = new_k;
+  session.mtp_.v_cache = new_v;
+  session.mtp_.block_k = new_block;
+  session.allocations_.push_back(new_k);
+  session.allocations_.push_back(new_v);
+  session.allocations_.push_back(new_block);
+  session.allocated_bytes_ +=
+      kv_bytes * 2 + block_bytes -
+      (old_cap * kv_row * sizeof(__half) * 2 +
+       (old_cap / c.compress_ratio + 1) * c.indexer_head_dim * sizeof(__half));
+  session.mtp_kv_capacity_ = want;
+  (void)old_cap;
+  return Check(hipDeviceSynchronize(), "mtp kv grow sync", error_msg);
+}
+
 bool Executor::EnsureSessionKv(Session& session, std::uint32_t need,
                                std::string* error_msg) const {
+  if (!EnsureMtpKvCapacity(session, need, error_msg)) {
+    return false;
+  }
   if (attention_pool_ == nullptr || !session.kv_pooled_) {
     return true;
   }
@@ -850,56 +959,45 @@ bool Executor::EnsureSessionKv(Session& session, std::uint32_t need,
     return true;
   };
 
+  const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
+  auto align = [ratio](std::uint32_t n) {
+    return ((n + ratio - 1) / ratio) * ratio;
+  };
   if (session.kv_reserved_ == 0) {
     std::uint32_t base = 0;
-    const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
-    auto align = [ratio](std::uint32_t n) {
-      return ((n + ratio - 1) / ratio) * ratio;
-    };
-    std::uint32_t want = align(session.max_context_);
-    if (want > attention_pool_->positions.capacity()) {
-      want = align(need);
+    std::uint32_t want = align(need);
+    if (want < need) {
+      want = need;
     }
-    if (!attention_pool_->positions.Reserve(want, &base)) {
-      want = align(need);
-      if (want < need) {
-        want = need;
-      }
-      if (!attention_pool_->positions.Reserve(want, &base)) {
-        AssignError(error_msg, "shared attention KV pool is exhausted");
-        return false;
-      }
+    if (want > attention_pool_->positions.capacity() ||
+        !attention_pool_->positions.Reserve(want, &base)) {
+      AssignError(error_msg, "shared attention KV pool is exhausted");
+      return false;
     }
     session.kv_base_ = base;
     session.kv_reserved_ = want;
     BindSessionKv(session);
     return true;
   }
-  const std::uint32_t ratio = std::max<std::uint32_t>(1, c.compress_ratio);
-  const std::uint32_t grow_to = ((need + ratio - 1) / ratio) * ratio;
+  const std::uint32_t grow_to = align(need);
   if (attention_pool_->positions.TryGrow(session.kv_base_, session.kv_reserved_,
                                          grow_to)) {
     session.kv_reserved_ = grow_to;
     return true;
   }
   std::uint32_t new_base = 0;
-  std::uint32_t want = ((session.max_context_ + ratio - 1) / ratio) * ratio;
-  if (want > attention_pool_->positions.capacity() ||
-      !attention_pool_->positions.Reserve(want, &new_base)) {
-    want = grow_to;
-    if (!attention_pool_->positions.Reserve(want, &new_base)) {
-      AssignError(error_msg, "shared attention KV pool is exhausted");
-      return false;
-    }
+  if (!attention_pool_->positions.Reserve(grow_to, &new_base)) {
+    AssignError(error_msg, "shared attention KV pool is exhausted");
+    return false;
   }
   const std::uint32_t live = std::min(session.position_, session.kv_reserved_);
   if (!copy_rows(session.kv_base_, new_base, live)) {
-    attention_pool_->positions.Release(new_base, want);
+    attention_pool_->positions.Release(new_base, grow_to);
     return false;
   }
   attention_pool_->positions.Release(session.kv_base_, session.kv_reserved_);
   session.kv_base_ = new_base;
-  session.kv_reserved_ = want;
+  session.kv_reserved_ = grow_to;
   BindSessionKv(session);
   return true;
 }
@@ -1614,13 +1712,15 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output) const {
   const Config& c = config();
+  const auto yarn = MakeYarnScales(options_.rope_yarn_factor);
+  const bool yarn_active = options_.rope_yarn_factor > 1;
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        !projections_ready && n_tokens >= 1024 &&
+        !yarn_active && !projections_ready && n_tokens >= 1024 &&
         n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
         l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
         c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
@@ -1645,7 +1745,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
           s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-          c.rms_eps, stream_, s.rope, prefill_phase);
+          c.rms_eps, stream_, s.rope, prefill_phase, yarn.freq_scale,
+          yarn.attn_factor);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -1669,9 +1770,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
     Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn.freq_scale, yarn.attn_factor);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_, s.rope);
+         c.rope_theta, stream_, s.rope, yarn.freq_scale, yarn.attn_factor);
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
   }
@@ -1694,11 +1795,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         pos, c.rope_theta, stream_, s.rope);
+         pos, c.rope_theta, stream_, s.rope, yarn.freq_scale, yarn.attn_factor);
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_, s.rope);
+                      index_capacity, stream_, s.rope, yarn.freq_scale,
+                      yarn.attn_factor);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
     const std::uint32_t blocks =

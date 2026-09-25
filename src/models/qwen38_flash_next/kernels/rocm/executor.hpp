@@ -111,6 +111,9 @@ private:
   bool kv_pooled_{false};  ///< trunk KV/block_k come from the executor pool
   std::uint32_t kv_base_{0};
   std::uint32_t kv_reserved_{0};
+  /// Allocated rows in mtp_.k_cache/v_cache/block_k (grows with need when
+  /// the trunk KV is pooled).
+  std::uint32_t mtp_kv_capacity_{0};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
@@ -149,9 +152,11 @@ public:
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
     /// Shared attention-position capacity across sessions. Zero keeps today's
-    /// private per-session KV arenas. Non-zero allocates one Halogen-style
-    /// pool; sessions reserve contiguous spans lazily as context grows.
+    /// private per-session KV arenas. Non-zero allocates one shared pool;
+    /// sessions reserve contiguous spans lazily as context grows.
     std::uint32_t kv_pool_positions{0};
+    /// Static YaRN factor (`0`/`1` = off, `4` = ~1M context ceiling).
+    std::uint32_t rope_yarn_factor{0};
   };
 
   ~Executor();
@@ -399,6 +404,8 @@ private:
                bool candidates, std::string* error_msg) const;
   [[nodiscard]] bool EnsureSessionKv(Session& session, std::uint32_t need,
                                      std::string* error_msg) const;
+  [[nodiscard]] bool EnsureMtpKvCapacity(Session& session, std::uint32_t need,
+                                         std::string* error_msg) const;
   void BindSessionKv(Session& session) const;
   void ReleaseSessionKv(Session& session) const;
   /// Enqueues one trunk batch (control and token upload through logits).

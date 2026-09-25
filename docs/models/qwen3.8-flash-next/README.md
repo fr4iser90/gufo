@@ -34,10 +34,12 @@ prior reasoning. Use the [reasoning controls](../../SERVER.md#reasoning-controls
 for explicit effort/thinking overrides. Memory grows with used context and selected rollback depth;
 admission reserves the configured capacity before creating sessions.
 
-`--kv-pool-positions N` (Flash-Next HTTP only) enables a Halogen-style shared
-attention KV pool. Sessions keep private SSM/indexer/MTP state and reserve
-contiguous spans from the pool as context grows. `N` must be at least
-`--context`. Example matching Halogen's "two slots share one full context":
+`--kv-pool-positions N` (Flash-Next HTTP only) enables a shared attention KV
+pool. Sessions keep private SSM/indexer/MTP state and reserve contiguous spans
+from the pool as context grows. `N` must be at least `--context`. At load, Gufo
+fits the pool to host RAM (weights + `--host-reserve-gib`, default 16) and may
+lower `N`, logging `event=kv_pool_fit`. Example for two concurrent requests
+sharing one native context budget:
 
 ```sh
 ./result/bin/gufo serve llm --model "$MODEL" --speculative mtp \
@@ -45,8 +47,25 @@ contiguous spans from the pool as context grows. `N` must be at least
   --kv-pool-positions 262144
 ```
 
-Unset (`0`, the default) keeps today's private per-session arenas
-(`sessions × context`). YaRN extension beyond the native 262144 is unsupported.
+Unset (`0`, the default) keeps private per-session arenas
+(`sessions × context`).
+
+### Long context (~1M)
+
+Native training length is 262144. Opt in to static YaRN ×4 for a 1_048_576
+ceiling, then set `--context` and `--kv-pool-positions` up to that limit. The
+shared pool still auto-fits; MTP draft KV grows with need instead of claiming
+the full context at session create:
+
+```sh
+./result/bin/gufo serve llm --model "$MODEL" --speculative mtp \
+  --mtp-model "$MTP" --sessions 1 --context 1048576 \
+  --kv-pool-positions 1048576 --rope-yarn 4
+```
+
+If fit refuses, levers are: lower `--kv-pool-positions` / `--context`, lower
+`--host-reserve-gib`, fewer `--sessions`, disable MTP, or a lower-bpw GGUF.
+Load logs `event=weight_stats` with bits-per-weight from the tensor table.
 
 ## Images
 

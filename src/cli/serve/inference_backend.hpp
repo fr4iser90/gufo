@@ -82,7 +82,10 @@ public:
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
-            std::uint32_t kv_pool_positions = 0);
+            std::uint32_t kv_pool_positions = 0,
+            std::uint32_t rope_yarn_factor = 0,
+            std::uint64_t host_reserve_gib = 16,
+            std::uint32_t* effective_kv_pool_positions = nullptr);
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

@@ -37,7 +37,8 @@ void L2Norm(std::span<float> x, float eps);
 /// Text-only IMRoPE has equal positions on every section, so it is exactly
 /// this rotation.
 void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
-          std::uint32_t rotary_dim, std::uint32_t pos, float theta);
+          std::uint32_t rotary_dim, std::uint32_t pos, float theta,
+          float freq_scale = 1.0F, float attn_factor = 1.0F);
 
 }  // namespace gufo::models::qwen38_flash_next::cpu
 

@@ -893,6 +893,8 @@ int RunServe(std::span<const char* const> args) {
     std::string served_model_name;
     std::uint32_t max_context = 4096;
     std::uint32_t kv_pool_positions = 0;
+    std::uint32_t rope_yarn_factor = 0;
+    std::uint64_t host_reserve_gib = 16;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
@@ -943,6 +945,14 @@ int RunServe(std::span<const char* const> args) {
         "", "--kv-pool-positions", "N",
         "Shared attention KV positions for Flash-Next (0=private arenas)",
         "Model", &kv_pool_positions);
+    llm_parser.AddOption(
+        "", "--rope-yarn", "N",
+        "Flash-Next static YaRN factor: 0/1 off, 4 for ~1M context ceiling",
+        "Model", &rope_yarn_factor);
+    llm_parser.AddOption(
+        "", "--host-reserve-gib", "N",
+        "Host GiB kept free when fitting --kv-pool-positions (default: 16)",
+        "Model", &host_reserve_gib);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default maximum new tokens per response (default: 128)",
@@ -1139,7 +1149,8 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path, kv_pool_positions)) {
+                       vision_model_path, kv_pool_positions, rope_yarn_factor,
+                       host_reserve_gib, &kv_pool_positions)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
@@ -1159,6 +1170,8 @@ int RunServe(std::span<const char* const> args) {
         " sessions=" + std::to_string(session_count) +
         " context_tokens=" + std::to_string(max_context) +
         " kv_pool_positions=" + std::to_string(kv_pool_positions) +
+        " rope_yarn=" + std::to_string(rope_yarn_factor) +
+        " host_reserve_gib=" + std::to_string(host_reserve_gib) +
         " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));

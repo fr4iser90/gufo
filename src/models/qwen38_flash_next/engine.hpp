@@ -17,6 +17,7 @@
 #include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
+#include "src/models/qwen38_flash_next/yarn.hpp"
 
 namespace gufo::core {
 class GgufReader;
@@ -45,9 +46,12 @@ struct ModelOptions {
   /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
   /// it independent of scheduler timing preserves seeded request replay.
   std::uint32_t decode_concurrency = 1;
-  /// Shared attention KV positions across sessions (Halogen-style). Zero
-  /// keeps private per-session arenas. Must be >= max_context when set.
+  /// Shared attention KV positions across sessions. Zero keeps private
+  /// per-session arenas. Must be >= max_context when set.
   std::uint32_t kv_pool_positions = 0;
+  /// Static YaRN factor. `0`/`1` keep native RoPE; `4` raises the context
+  /// ceiling to `context_length * 4` (~1M on the native 262144).
+  std::uint32_t rope_yarn_factor = 0;
 };
 
 class Session;

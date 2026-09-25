@@ -107,6 +107,7 @@ add_library(gufo_core STATIC
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp
+  src/core/gguf_weight_stats.cpp
   src/core/sampling.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
@@ -551,6 +552,11 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
+
+  add_executable(gguf_weight_stats_test tests/core/gguf_weight_stats_test.cpp)
+  target_link_libraries(gguf_weight_stats_test PRIVATE gufo_core)
+  add_test(NAME gguf_weight_stats_test COMMAND gguf_weight_stats_test)
+  set_tests_properties(gguf_weight_stats_test PROPERTIES LABELS "cpu;core;gguf")
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)

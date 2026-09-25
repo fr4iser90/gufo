@@ -25,6 +25,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/gguf_weight_stats.hpp"
 #include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -38,6 +39,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/memory_fit.hpp"
 #endif
 
 namespace gufo::server {
@@ -2846,15 +2848,15 @@ InferenceBackend::InferenceBackend() : impl_(std::make_unique<Impl>()) {}
 
 InferenceBackend::~InferenceBackend() = default;
 
-bool InferenceBackend::load(const std::string& model_path, std::string* error,
-                            std::uint32_t max_context,
-                            std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config,
-                            const std::string& vision_model_path,
-                            std::uint32_t kv_pool_positions) {
+bool InferenceBackend::load(
+    const std::string& model_path, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    const TextSpeculativeConfig& speculative_config,
+    const TextDiskCacheConfig& disk_cache_config,
+    const std::string& vision_model_path, std::uint32_t kv_pool_positions,
+    std::uint32_t rope_yarn_factor, std::uint64_t host_reserve_gib,
+    std::uint32_t* effective_kv_pool_positions) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -2864,10 +2866,17 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  if (kv_pool_positions != 0 &&
+  const auto weight_stats = core::ComputeGgufWeightStats(*reader);
+  Logger::Info("loader", "event=weight_stats " +
+                             core::FormatGgufWeightStats(weight_stats));
+  if (effective_kv_pool_positions != nullptr) {
+    *effective_kv_pool_positions = kv_pool_positions;
+  }
+  if ((kv_pool_positions != 0 || rope_yarn_factor != 0) &&
       reader->GetMetadataString("general.architecture") != "qwen4exp") {
     SetError(error,
-             "--kv-pool-positions is only supported for Qwen3.8-Flash-Next");
+             "--kv-pool-positions and --rope-yarn are only supported for "
+             "Qwen3.8-Flash-Next");
     return false;
   }
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
@@ -2955,6 +2964,40 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Unsupported Qwen3.8-Flash-Next chat template: " + load_error);
       return false;
     }
+    if (kv_pool_positions != 0) {
+      auto config =
+          models::qwen38_flash_next::Config::FromGguf(*reader, &load_error);
+      if (!config.has_value()) {
+        SetError(error, "Failed to read Flash-Next config for memory fit: " +
+                            load_error);
+        return false;
+      }
+      const auto fit = models::qwen38_flash_next::FitSharedKvPool(
+          *config,
+          models::qwen38_flash_next::SharedKvFitRequest{
+              .requested_positions = kv_pool_positions,
+              .max_context = max_context,
+              .sessions = session_count,
+              .weight_bytes = weight_stats.bytes,
+              .mem_total_bytes = models::qwen38_flash_next::ReadMemTotalBytes(),
+              .host_reserve_bytes =
+                  host_reserve_gib * models::qwen38_flash_next::kGiB,
+              .speculative =
+                  speculative_config.backend == TextSpeculativeBackend::kMtp,
+              .max_batch = static_cast<std::uint32_t>(
+                  std::clamp<std::size_t>(session_count, 1, 8)),
+          });
+      Logger::Info("loader", "event=kv_pool_fit " + fit.message + " " +
+                                 Logger::MemoryStatus());
+      if (!fit.ok) {
+        SetError(error, fit.message);
+        return false;
+      }
+      kv_pool_positions = fit.positions;
+      if (effective_kv_pool_positions != nullptr) {
+        *effective_kv_pool_positions = kv_pool_positions;
+      }
+    }
     // The model owns prefill geometry for both bulk and scheduled requests.
     auto model = models::qwen38_flash_next::Model::Load(
         model_path,
@@ -2969,6 +3012,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
             .kv_pool_positions = kv_pool_positions,
+            .rope_yarn_factor = rope_yarn_factor,
         },
         &load_error);
     if (model == nullptr) {
@@ -3036,6 +3080,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)kv_pool_positions;
+  (void)rope_yarn_factor;
+  (void)host_reserve_gib;
+  (void)effective_kv_pool_positions;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
